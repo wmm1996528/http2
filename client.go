@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -2142,13 +2143,14 @@ func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2
 		peerMaxHeaderListSize: 0xffffffffffffffff,               // "infinite", per spec. Use 2^64-1 instead.
 	}
 
-	cc.flow.add(int32(http2initialWindowSize))
+	cc.flow.add(http2initialWindowSize)
 
-	// TODO: adjust this writer size to account for frame size +
-	// MTU + crypto/tls record padding.
 	cc.bw = bufio.NewWriter(c)
+	// cc.bw = bufio.NewWriter(stickyErrWriter{
+	// 	conn: c,
+	// })
 	cc.fr = http2NewFramer(cc.bw, bufio.NewReader(c))
-	cc.fr.ReadMetaHeaders = hpack.NewDecoder(uint32(http2initialHeaderTableSize), nil)
+	cc.fr.ReadMetaHeaders = hpack.NewDecoder(http2initialHeaderTableSize, nil)
 	cc.fr.MaxHeaderListSize = maxHeaderListSize
 
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
@@ -2159,6 +2161,7 @@ func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2
 	for i, setting := range cc.spec.initialSetting {
 		initialSettings[i] = http2Setting{ID: http2SettingID(setting.Id), Val: setting.Val}
 	}
+
 	if _, err := cc.bw.Write(http2clientPreface); err != nil {
 		return nil, err
 	}
@@ -2175,15 +2178,7 @@ func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2
 	cc.loop = &http2clientConnReadLoop{cc: cc}
 	done := make(chan struct{})
 	go cc.run(done)
-	select {
-	case <-done:
-		return cc, nil
-	case <-ctx.Done():
-		if cc.err != nil {
-			return nil, cc.err
-		}
-		return nil, ctx.Err()
-	}
+	return cc, nil
 }
 
 // SetDoNotReuse marks cc as not reusable for future HTTP requests.
@@ -2197,6 +2192,9 @@ func (cc *Http2ClientConn) Close() error {
 	return nil
 }
 func (cc *Http2ClientConn) setGoAway(f *http2GoAwayFrame) error {
+	if f.ErrCode == 0 {
+		return nil
+	}
 	return fmt.Errorf("http2: server sent GOAWAY with error code %v", f.ErrCode)
 }
 
@@ -3004,3 +3002,19 @@ type http2missingBody struct{}
 
 func (http2missingBody) Close() error             { return nil }
 func (http2missingBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+type stickyErrWriter struct {
+	conn net.Conn
+}
+
+func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
+	for {
+		nn, err := sew.conn.Write(p[n:])
+		n += nn
+		if n < len(p) && nn > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+			// Keep extending the deadline so long as we're making progress.
+			continue
+		}
+		return n, err
+	}
+}
