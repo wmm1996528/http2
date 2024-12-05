@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -18,13 +17,13 @@ import (
 
 	"crypto/rand"
 
-	"math"
 	"math/bits"
 	"net"
 
 	"net/textproto"
 
 	"github.com/gospider007/ja3"
+	"github.com/gospider007/tools"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
 )
@@ -1570,15 +1569,6 @@ func (mh *http2MetaHeadersFrame) PseudoFields() []hpack.HeaderField {
 	return mh.Fields
 }
 
-func (fr *http2Framer) maxHeaderStringLen() int {
-	v := int(fr.maxHeaderListSize())
-	if v < 0 {
-		// If maxHeaderListSize overflows an int, use no limit (0).
-		return 0
-	}
-	return v
-}
-
 // readMetaFrame returns 0 or more CONTINUATION frames from fr and
 // merge them into the provided hf and returns a MetaHeadersFrame
 // with the decoded hpack values.
@@ -1586,16 +1576,15 @@ func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (http2Frame, error) 
 	if fr.AllowIllegalReads {
 		return nil, errors.New("illegal use of AllowIllegalReads with ReadMetaHeaders")
 	}
+
 	mh := &http2MetaHeadersFrame{
 		http2HeadersFrame: hf,
 	}
 	var remainSize = fr.maxHeaderListSize()
 	var sawRegular bool
-
 	var invalid error // pseudo header field errors
 	hdec := fr.ReadMetaHeaders
 	hdec.SetEmitEnabled(true)
-	hdec.SetMaxStringLength(fr.maxHeaderStringLen())
 	hdec.SetEmitFunc(func(hf hpack.HeaderField) {
 		if !httpguts.ValidHeaderFieldValue(hf.Value) {
 			// Don't include the value in the error, because it may be sensitive.
@@ -1649,7 +1638,6 @@ func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (http2Frame, error) 
 			// but the structure of the server's frame writer makes this difficult.
 			return mh, http2ConnectionError(errHttp2CodeProtocol)
 		}
-
 		// Also close the connection after any CONTINUATION frame following an
 		// invalid header, since we stop tracking the size of the headers after
 		// an invalid one.
@@ -1658,7 +1646,6 @@ func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (http2Frame, error) 
 			// but the structure of the server's frame writer makes this difficult.
 			return mh, http2ConnectionError(errHttp2CodeProtocol)
 		}
-
 		if _, err := hdec.Write(frag); err != nil {
 			return mh, http2ConnectionError(errHttp2CodeCompression)
 		}
@@ -1790,10 +1777,6 @@ const (
 	// https://httpwg.org/specs/rfc7540.html#rfc.section.6.5.2
 
 	// https://httpwg.org/specs/rfc7540.html#SettingValues
-	http2initialHeaderTableSize = 4096
-
-	http2initialWindowSize = 65535 // 6.9.2 Initial Flow Control Window Size
-
 )
 
 var (
@@ -1942,14 +1925,6 @@ func http2foreachHeaderElement(v string, fn func(string)) {
 	}
 }
 
-const (
-	http2initialMaxConcurrentStreams = 100
-
-	// defaultMaxConcurrentStreams is a connections default maxConcurrentStreams
-	// if the server doesn't include one in its initial SETTINGS frame.
-	http2defaultMaxConcurrentStreams = 1000
-)
-
 // ClientConn is the state of a single HTTP/2 client connection to an
 // HTTP/2 server.
 type Http2ClientConn struct {
@@ -1964,12 +1939,10 @@ type Http2ClientConn struct {
 	flow              http2outflow // our conn-level flow control quota (cs.outflow is per stream)
 	inflow            http2inflow  // peer's conn-level flow control
 
-	nextStreamID           uint32
-	maxFrameSize           uint32
-	maxConcurrentStreams   uint32
-	peerMaxHeaderListSize  uint64
-	peerMaxHeaderTableSize uint32
-	initialWindowSize      uint32
+	nextStreamID          uint32
+	maxFrameSize          uint32
+	peerMaxHeaderListSize uint64
+	initialWindowSize     uint32
 
 	bw *bufio.Writer
 	fr *http2Framer
@@ -1993,54 +1966,49 @@ type http2clientStream struct {
 	reqBodyContentLength int64 // -1 means unknown
 }
 
-func (cc *Http2ClientConn) run(done chan struct{}) (err error) {
-	defer cc.Close()
+func (cc *Http2ClientConn) run() (err error) {
 	defer func() {
 		cc.err = err
+		cc.Close()
 	}()
 	var f http2Frame
-	var initOk bool
 	for {
 		if f, err = cc.fr.ReadFrame(); err != nil {
-			return
+			return tools.WrapError(err, "ReadFrame")
 		}
 		switch f := f.(type) {
 		case *http2MetaHeadersFrame:
-			if cc.http2clientStream.resp, err = cc.loop.processHeaders2(cc.http2clientStream, f); err != nil {
-				return err
+			if cc.http2clientStream.resp, err = cc.loop.handleResponse(cc.http2clientStream, f); err != nil {
+				return tools.WrapError(err, "handleResponse")
 			}
 			cc.http2clientStream.headCnl()
 		case *http2DataFrame:
-			if _, err = cc.loop.processData2(cc.http2clientStream, f); err != nil {
-				return err
+			if _, err = cc.loop.processData(cc.http2clientStream, f); err != nil {
+				return tools.WrapError(err, "processData")
 			}
 		case *http2GoAwayFrame:
 			if err = cc.loop.processGoAway(f); err != nil {
-				return err
+				return tools.WrapError(err, "processGoAway")
 			}
 		case *http2RSTStreamFrame:
-			if err = cc.loop.processResetStream2(f); err != nil {
-				return err
+			if err = cc.loop.processResetStream(f); err != nil {
+				return tools.WrapError(err, "processResetStream")
 			}
 		case *http2SettingsFrame:
 			if err = cc.loop.processSettings(f); err != nil {
-				return err
-			}
-			if !initOk {
-				initOk = true
-				close(done)
+				return tools.WrapError(err, "processSettings")
 			}
 		case *http2PushPromiseFrame:
 			if err = cc.loop.processPushPromise(); err != nil {
-				return err
+				return tools.WrapError(err, "processPushPromise")
 			}
 		case *http2WindowUpdateFrame:
-			if err = cc.loop.processWindowUpdate2(f); err != nil {
-				return err
+			if err = cc.loop.processWindowUpdate(f); err != nil {
+				return tools.WrapError(err, "processWindowUpdate")
 			}
 		case *http2PingFrame:
 			if err = cc.loop.processPing(f); err != nil {
-				return err
+				return tools.WrapError(err, "processPing")
 			}
 		default:
 		}
@@ -2137,30 +2105,29 @@ func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2
 		cnl:                   cnl,
 		tconn:                 c,
 		nextStreamID:          1,
-		maxFrameSize:          16 << 10,                         // spec default
-		initialWindowSize:     65535,                            // spec default
-		maxConcurrentStreams:  http2initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
-		peerMaxHeaderListSize: 0xffffffffffffffff,               // "infinite", per spec. Use 2^64-1 instead.
+		maxFrameSize:          16 << 10,           // spec default
+		initialWindowSize:     65535,              // spec default
+		peerMaxHeaderListSize: 0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
 	}
-
-	cc.flow.add(http2initialWindowSize)
-
+	cc.flow.add(int32(cc.initialWindowSize))
 	cc.bw = bufio.NewWriter(c)
-	// cc.bw = bufio.NewWriter(stickyErrWriter{
-	// 	conn: c,
-	// })
 	cc.fr = http2NewFramer(cc.bw, bufio.NewReader(c))
-	cc.fr.ReadMetaHeaders = hpack.NewDecoder(http2initialHeaderTableSize, nil)
+	cc.fr.ReadMetaHeaders = hpack.NewDecoder(cc.spec.headerTableSize, nil)
 	cc.fr.MaxHeaderListSize = maxHeaderListSize
-
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
-	cc.henc.SetMaxDynamicTableSizeLimit(http2initialHeaderTableSize)
-	cc.peerMaxHeaderTableSize = http2initialHeaderTableSize
-
+	cc.henc.SetMaxDynamicTableSizeLimit(cc.spec.headerTableSize)
 	initialSettings := make([]http2Setting, len(cc.spec.initialSetting))
 	for i, setting := range cc.spec.initialSetting {
 		initialSettings[i] = http2Setting{ID: http2SettingID(setting.Id), Val: setting.Val}
 	}
+
+	// initialSettings := []http2Setting{
+	// 	// {ID: http2SettingEnablePush, Val: 0},
+	// 	{ID: http2SettingInitialWindowSize, Val: 4194304},
+	// }
+	// initialSettings = append(initialSettings, http2Setting{ID: http2SettingMaxFrameSize, Val: 16384})
+	// initialSettings = append(initialSettings, http2Setting{ID: http2SettingMaxHeaderListSize, Val: 10 << 20})
+	// initialSettings = append(initialSettings, http2Setting{ID: http2SettingHeaderTableSize, Val: 4096})
 
 	if _, err := cc.bw.Write(http2clientPreface); err != nil {
 		return nil, err
@@ -2171,13 +2138,12 @@ func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2
 	if err := cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
 		return nil, err
 	}
-	cc.inflow.init(int32(cc.spec.connFlow) + http2initialWindowSize)
+	cc.inflow.init(int32(cc.spec.connFlow) + int32(cc.initialWindowSize))
 	if err := cc.bw.Flush(); err != nil {
 		return nil, err
 	}
 	cc.loop = &http2clientConnReadLoop{cc: cc}
-	done := make(chan struct{})
-	go cc.run(done)
+	go cc.run()
 	return cc, nil
 }
 
@@ -2189,13 +2155,8 @@ func (cc *Http2ClientConn) Close() error {
 	}
 	cc.cnl()
 	cc.tconn.Close()
+	cc.http2clientStream.headCnl()
 	return nil
-}
-func (cc *Http2ClientConn) setGoAway(f *http2GoAwayFrame) error {
-	if f.ErrCode == 0 {
-		return nil
-	}
-	return fmt.Errorf("http2: server sent GOAWAY with error code %v", f.ErrCode)
 }
 
 // CanTakeNewRequest reports whether the connection can take a new request,
@@ -2281,10 +2242,9 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 	if cs.reqBody != nil {
 		defer cs.reqBody.Close()
 	}
-
 	select {
 	case <-cs.headCtx.Done():
-		return cs.resp, nil
+		return cs.resp, cc.err
 	case <-ctx.Done():
 		if cc.err != nil {
 			return nil, cc.err
@@ -2609,32 +2569,14 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, con
 			f("trailer", trailers)
 		}
 		for k, vv := range req.Header {
-			if http2asciiEqualFold(k, "host") || http2asciiEqualFold(k, "content-length") {
-				// Host is :authority, already sent.
-				// Content-Length is automatic, set below.
-				continue
-			} else if http2asciiEqualFold(k, "connection") ||
+			if http2asciiEqualFold(k, "host") ||
+				http2asciiEqualFold(k, "content-length") ||
+				http2asciiEqualFold(k, "connection") ||
 				http2asciiEqualFold(k, "proxy-connection") ||
 				http2asciiEqualFold(k, "transfer-encoding") ||
 				http2asciiEqualFold(k, "upgrade") ||
 				http2asciiEqualFold(k, "keep-alive") {
-				// Per 8.1.2.2 Connection-Specific Header
-				// Fields, don't send connection-specific
-				// fields. We have already checked if any
-				// are error-worthy so just ignore the rest.
 				continue
-			} else if http2asciiEqualFold(k, "user-agent") {
-				// Match Go's http1 behavior: at most one
-				// User-Agent. If set to nil or empty string,
-				// then omit it. Otherwise if not mentioned,
-				// include the default (below).
-				if len(vv) < 1 {
-					continue
-				}
-				vv = vv[:1]
-				if vv[0] == "" {
-					continue
-				}
 			} else if http2asciiEqualFold(k, "cookie") {
 				// Per 8.1.2.5 To allow for better compression efficiency, the
 				// Cookie header field MAY be split into separate header fields,
@@ -2775,10 +2717,6 @@ type http2clientConnReadLoop struct {
 	cc *Http2ClientConn
 }
 
-func (rl *http2clientConnReadLoop) processHeaders2(cs *http2clientStream, f *http2MetaHeadersFrame) (*http.Response, error) {
-	return rl.handleResponse(cs, f)
-}
-
 func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *http2MetaHeadersFrame) (*http.Response, error) {
 	if f.Truncated {
 		return nil, errHttp2ResponseHeaderListSize
@@ -2874,7 +2812,7 @@ func (b http2transportResponseBody) Read(p []byte) (n int, err error) {
 func (b http2transportResponseBody) Close() error {
 	return b.cs.bodyReader.Close()
 }
-func (rl *http2clientConnReadLoop) processData2(cs *http2clientStream, f *http2DataFrame) (bool, error) {
+func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2DataFrame) (bool, error) {
 	cc := rl.cc
 	data := f.Data()
 	if f.Length > 0 {
@@ -2911,7 +2849,10 @@ func (rl *http2clientConnReadLoop) processData2(cs *http2clientStream, f *http2D
 	return isEnd, nil
 }
 func (rl *http2clientConnReadLoop) processGoAway(f *http2GoAwayFrame) error {
-	return rl.cc.setGoAway(f)
+	if f.ErrCode == 0 {
+		return nil
+	}
+	return fmt.Errorf("http2: server sent GOAWAY with error code %v", f.ErrCode)
 }
 func (rl *http2clientConnReadLoop) processSettings(f *http2SettingsFrame) error {
 	cc := rl.cc
@@ -2928,21 +2869,14 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame)
 	cc := rl.cc
 	err := f.ForeachSetting(func(s http2Setting) error {
 		switch s.ID {
-		case http2SettingMaxFrameSize:
+		case http2SettingMaxFrameSize: //MAX_FRAME_SIZE
 			cc.maxFrameSize = s.Val
-		case http2SettingMaxConcurrentStreams:
-			cc.maxConcurrentStreams = s.Val
-		case http2SettingMaxHeaderListSize:
+		case http2SettingMaxHeaderListSize: //MAX_HEADER_LIST_SIZE
 			cc.peerMaxHeaderListSize = uint64(s.Val)
-		case http2SettingInitialWindowSize:
-			if s.Val > math.MaxInt32 {
-				return http2ConnectionError(errHttp2CodeFlowControl)
-			}
-			// cs.flow.add(int32(s.Val) - int32(cc.initialWindowSize))
+		case http2SettingInitialWindowSize: //INITIAL_WINDOW_SIZE
 			cc.initialWindowSize = s.Val
-		case http2SettingHeaderTableSize:
+		case http2SettingHeaderTableSize: //HEADER_TABLE_SIZE
 			cc.henc.SetMaxDynamicTableSize(s.Val)
-			cc.peerMaxHeaderTableSize = s.Val
 		default:
 		}
 		return nil
@@ -2950,19 +2884,16 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame)
 	if err != nil {
 		return err
 	}
-	if cc.maxConcurrentStreams == 0 {
-		cc.maxConcurrentStreams = http2defaultMaxConcurrentStreams
-	}
 	return nil
 }
-func (rl *http2clientConnReadLoop) processWindowUpdate2(f *http2WindowUpdateFrame) error {
+func (rl *http2clientConnReadLoop) processWindowUpdate(f *http2WindowUpdateFrame) error {
 	fl := &rl.cc.flow
 	if !fl.add(int32(f.Increment)) {
 		return http2ConnectionError(errHttp2CodeFlowControl)
 	}
 	return nil
 }
-func (rl *http2clientConnReadLoop) processResetStream2(f *http2RSTStreamFrame) error {
+func (rl *http2clientConnReadLoop) processResetStream(f *http2RSTStreamFrame) error {
 	return fmt.Errorf("stream error: %v", f.ErrCode)
 }
 func (cc *Http2ClientConn) Ping(ctx context.Context) error {
@@ -3002,19 +2933,3 @@ type http2missingBody struct{}
 
 func (http2missingBody) Close() error             { return nil }
 func (http2missingBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
-
-type stickyErrWriter struct {
-	conn net.Conn
-}
-
-func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
-	for {
-		nn, err := sew.conn.Write(p[n:])
-		n += nn
-		if n < len(p) && nn > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
-			// Keep extending the deadline so long as we're making progress.
-			continue
-		}
-		return n, err
-	}
-}
