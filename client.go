@@ -2244,6 +2244,7 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 	}
 	select {
 	case <-cs.headCtx.Done():
+		cs.resp.Request = req
 		return cs.resp, cc.err
 	case <-ctx.Done():
 		if cc.err != nil {
