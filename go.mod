@@ -29,7 +29,7 @@ require (
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/libdns/libdns v0.2.2 // indirect
 	github.com/mholt/acmez/v2 v2.0.3 // indirect
-	github.com/mholt/archives v0.0.0-20241203232558-998c9622f6b8 // indirect
+	github.com/mholt/archives v0.0.0-20241207175349-5e373c52f8aa // indirect
 	github.com/miekg/dns v1.1.62 // indirect
 	github.com/nwaples/rardecode/v2 v2.0.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect

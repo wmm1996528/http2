@@ -96,10 +96,6 @@ func (e http2ConnectionError) Error() string {
 	return fmt.Sprintf("connection error: %d", errHttp2Code(e))
 }
 
-var (
-	errHttp2PseudoAfterRegular = errors.New("pseudo header field after regular")
-)
-
 // inflowMinRefresh is the minimum number of bytes we'll send for a
 // flow control window update.
 const http2inflowMinRefresh = 4 << 10
@@ -375,7 +371,7 @@ func http2typeFrameParser(t http2FrameType) http2frameParser {
 //
 // See https://httpwg.org/specs/rfc7540.html#FrameHeader
 type http2FrameHeader struct {
-	valid bool // caller can access []byte fields in the Frame
+	// valid bool // caller can access []byte fields in the Frame
 
 	// Type is the 1 byte frame type. There are ten standard frame
 	// types, but extension frame types may be written by WriteRawFrame
@@ -435,14 +431,6 @@ func (h http2FrameHeader) writeDebug(buf *bytes.Buffer) {
 	fmt.Fprintf(buf, " len=%d", h.Length)
 }
 
-func (h *http2FrameHeader) checkValid() {
-	if !h.valid {
-		panic("Frame accessor called on non-owned Frame")
-	}
-}
-
-func (h *http2FrameHeader) invalidate() { h.valid = false }
-
 func http2readFrameHeader(buf []byte, r io.Reader) (http2FrameHeader, error) {
 	_, err := io.ReadFull(r, buf[:http2frameHeaderLen])
 	if err != nil {
@@ -453,7 +441,6 @@ func http2readFrameHeader(buf []byte, r io.Reader) (http2FrameHeader, error) {
 		Type:     http2FrameType(buf[3]),
 		Flags:    http2Flags(buf[4]),
 		StreamID: binary.BigEndian.Uint32(buf[5:]) & (1<<31 - 1),
-		valid:    true,
 	}, nil
 }
 
@@ -467,15 +454,11 @@ type http2Frame interface {
 
 	// invalidate is called by Framer.ReadFrame to make this
 	// frame's buffers as being invalid, since the subsequent
-	// frame will reuse them.
-	invalidate()
 }
 
 // A Framer reads and writes Frames.
 type http2Framer struct {
-	r         io.Reader
-	lastFrame http2Frame
-	errDetail error
+	r io.Reader
 
 	// countError is a non-nil func that's called on a frame parse
 	// error with some unique error path token. It's initialized
@@ -484,10 +467,10 @@ type http2Framer struct {
 
 	// lastHeaderStream is non-zero if the last frame was an
 	// unfinished HEADERS/CONTINUATION.
-	lastHeaderStream uint32
+	// lastHeaderStream uint32
 
-	maxReadSize uint32
-	headerBuf   [http2frameHeaderLen]byte
+	// maxReadSize uint32
+	headerBuf [http2frameHeaderLen]byte
 
 	// TODO: let getReadBuf be configurable, and use a less memory-pinning
 	// allocator in server.go to minimize memory pinned for many idle conns.
@@ -498,29 +481,7 @@ type http2Framer struct {
 	w    io.Writer
 	wbuf []byte
 
-	// AllowIllegalReads permits the Framer's ReadFrame method
-	// to return non-compliant frames or frame orders.
-	// This is for testing and permits using the Framer to test
-	// other HTTP/2 implementations' conformance to the spec.
-	// It is not compatible with ReadMetaHeaders.
-	AllowIllegalReads bool
-
-	// ReadMetaHeaders if non-nil causes ReadFrame to merge
-	// HEADERS and CONTINUATION frames together and return
-	// MetaHeadersFrame instead.
 	ReadMetaHeaders *hpack.Decoder
-
-	// MaxHeaderListSize is the http2 MAX_HEADER_LIST_SIZE.
-	// It's used only if ReadMetaHeaders is set; 0 means a sane default
-	// (currently 16MB)
-	// If the limit is hit, MetaHeadersFrame.Truncated is set true.
-	MaxHeaderListSize uint32
-
-	// TODO: track which type of frame & with which flags was sent
-	// last. Then return an error (unless AllowIllegalWrites) if
-	// we're in the middle of a header block and a
-	// non-Continuation or Continuation on a different stream is
-	// attempted to be written.
 
 	logReads, logWrites bool
 
@@ -528,15 +489,6 @@ type http2Framer struct {
 	debugFramerBuf *bytes.Buffer
 
 	frameCache *http2frameCache // nil if frames aren't reused (default)
-}
-
-const maxHeaderListSize = 16 << 20
-
-func (fr *http2Framer) maxHeaderListSize() uint32 {
-	if fr.MaxHeaderListSize == 0 {
-		return 16 << 20 // sane default, per docs
-	}
-	return fr.MaxHeaderListSize
 }
 
 func (f *http2Framer) startWrite(ftype http2FrameType, flags http2Flags, streamID uint32) {
@@ -582,7 +534,6 @@ func (f *http2Framer) logWrite() {
 		f.debugFramer.logReads = false // we log it ourselves, saying "wrote" below
 		// Let us read anything, even if we accidentally wrote it
 		// in the wrong order:
-		f.debugFramer.AllowIllegalReads = true
 	}
 	f.debugFramerBuf.Write(f.wbuf)
 	_, err := f.debugFramer.ReadFrame()
@@ -600,11 +551,6 @@ func (f *http2Framer) writeUint16(v uint16) { f.wbuf = append(f.wbuf, byte(v>>8)
 func (f *http2Framer) writeUint32(v uint32) {
 	f.wbuf = append(f.wbuf, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
-
-const (
-	http2minMaxFrameSize = 1 << 14
-	http2maxFrameSize    = 1<<24 - 1
-)
 
 // SetReuseFrames allows the Framer to reuse Frames.
 // If called on a Framer, Frames returned by calls to ReadFrame are only
@@ -641,19 +587,7 @@ func http2NewFramer(w io.Writer, r io.Reader) *http2Framer {
 		fr.readBuf = make([]byte, size)
 		return fr.readBuf
 	}
-	fr.SetMaxReadFrameSize(http2maxFrameSize)
 	return fr
-}
-
-// SetMaxReadFrameSize sets the maximum size of a frame
-// that will be read by a subsequent call to ReadFrame.
-// It is the caller's responsibility to advertise this
-// limit with a SETTINGS frame.
-func (fr *http2Framer) SetMaxReadFrameSize(v uint32) {
-	if v > http2maxFrameSize {
-		v = http2maxFrameSize
-	}
-	fr.maxReadSize = v
 }
 
 // ErrorDetail returns a more detailed error of the last error
@@ -663,9 +597,6 @@ func (fr *http2Framer) SetMaxReadFrameSize(v uint32) {
 // to return a non-nil value and like the rest of the http2 package,
 // its return value is not protected by an API compatibility promise.
 // ErrorDetail is reset after the next call to ReadFrame.
-func (fr *http2Framer) ErrorDetail() error {
-	return fr.errDetail
-}
 
 // ErrFrameTooLarge is returned from Framer.ReadFrame when the peer
 // sends a frame that is larger than declared with SetMaxReadFrameSize.
@@ -682,16 +613,9 @@ var errHttp2FrameTooLarge = errors.New("http2: frame too large")
 // If ReadFrame returns an error and a non-nil Frame, the Frame's StreamID
 // indicates the stream responsible for the error.
 func (fr *http2Framer) ReadFrame() (http2Frame, error) {
-	fr.errDetail = nil
-	if fr.lastFrame != nil {
-		fr.lastFrame.invalidate()
-	}
 	fh, err := http2readFrameHeader(fr.headerBuf[:], fr.r)
 	if err != nil {
 		return nil, err
-	}
-	if fh.Length > fr.maxReadSize {
-		return nil, errHttp2FrameTooLarge
 	}
 	payload := fr.getReadBuf(fh.Length)
 	if _, err := io.ReadFull(fr.r, payload); err != nil {
@@ -701,61 +625,10 @@ func (fr *http2Framer) ReadFrame() (http2Frame, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := fr.checkFrameOrder(f); err != nil {
-		return nil, err
-	}
 	if fh.Type == http2FrameHeaders && fr.ReadMetaHeaders != nil {
 		return fr.readMetaFrame(f.(*http2HeadersFrame))
 	}
 	return f, nil
-}
-
-// connError returns ConnectionError(code) but first
-// stashes away a public reason to the caller can optionally relay it
-// to the peer before hanging up on them. This might help others debug
-// their implementations.
-func (fr *http2Framer) connError(code errHttp2Code, reason string) error {
-	fr.errDetail = errors.New(reason)
-	return http2ConnectionError(code)
-}
-
-// checkFrameOrder reports an error if f is an invalid frame to return
-// next from ReadFrame. Mostly it checks whether HEADERS and
-// CONTINUATION frames are contiguous.
-func (fr *http2Framer) checkFrameOrder(f http2Frame) error {
-	last := fr.lastFrame
-	fr.lastFrame = f
-	if fr.AllowIllegalReads {
-		return nil
-	}
-
-	fh := f.Header()
-	if fr.lastHeaderStream != 0 {
-		if fh.Type != http2FrameContinuation {
-			return fr.connError(errHttp2CodeProtocol,
-				fmt.Sprintf("got %s for stream %d; expected CONTINUATION following %s for stream %d",
-					fh.Type, fh.StreamID,
-					last.Header().Type, fr.lastHeaderStream))
-		}
-		if fh.StreamID != fr.lastHeaderStream {
-			return fr.connError(errHttp2CodeProtocol,
-				fmt.Sprintf("got CONTINUATION for stream %d; expected stream %d",
-					fh.StreamID, fr.lastHeaderStream))
-		}
-	} else if fh.Type == http2FrameContinuation {
-		return fr.connError(errHttp2CodeProtocol, fmt.Sprintf("unexpected CONTINUATION for stream %d", fh.StreamID))
-	}
-
-	switch fh.Type {
-	case http2FrameHeaders, http2FrameContinuation:
-		if fh.Flags.Has(http2FlagHeadersEndHeaders) {
-			fr.lastHeaderStream = 0
-		} else {
-			fr.lastHeaderStream = fh.StreamID
-		}
-	}
-
-	return nil
 }
 
 // A DataFrame conveys arbitrary, variable-length sequences of octets
@@ -775,7 +648,6 @@ func (f *http2DataFrame) StreamEnded() bool {
 // The caller must not retain the returned memory past the next
 // call to ReadFrame.
 func (f *http2DataFrame) Data() []byte {
-	f.checkValid()
 	return f.data
 }
 
@@ -917,7 +789,6 @@ func (f *http2SettingsFrame) IsAck() bool {
 }
 
 func (f *http2SettingsFrame) Value(id http2SettingID) (v uint32, ok bool) {
-	f.checkValid()
 	for i := 0; i < f.NumSettings(); i++ {
 		if s := f.Setting(i); s.ID == id {
 			return s.Val, true
@@ -972,7 +843,6 @@ func (f *http2SettingsFrame) HasDuplicates() bool {
 // ForeachSetting runs fn for each setting.
 // It stops and returns the first error.
 func (f *http2SettingsFrame) ForeachSetting(fn func(http2Setting) error) error {
-	f.checkValid()
 	for i := 0; i < f.NumSettings(); i++ {
 		if err := fn(f.Setting(i)); err != nil {
 			return err
@@ -1053,7 +923,6 @@ type http2GoAwayFrame struct {
 // The caller must not retain the returned memory past the next
 // call to ReadFrame.
 func (f *http2GoAwayFrame) DebugData() []byte {
-	f.checkValid()
 	return f.debugData
 }
 
@@ -1095,7 +964,6 @@ type http2UnknownFrame struct {
 // The memory is owned by the Framer and is invalidated when the next
 // frame is read.
 func (f *http2UnknownFrame) Payload() []byte {
-	f.checkValid()
 	return f.p
 }
 
@@ -1158,7 +1026,6 @@ type http2HeadersFrame struct {
 }
 
 func (f *http2HeadersFrame) HeaderBlockFragment() []byte {
-	f.checkValid()
 	return f.headerFragBuf
 }
 
@@ -1349,7 +1216,6 @@ func http2parseContinuationFrame(_ *http2frameCache, fh http2FrameHeader, countE
 }
 
 func (f *http2ContinuationFrame) HeaderBlockFragment() []byte {
-	f.checkValid()
 	return f.headerFragBuf
 }
 
@@ -1380,7 +1246,6 @@ type http2PushPromiseFrame struct {
 }
 
 func (f *http2PushPromiseFrame) HeaderBlockFragment() []byte {
-	f.checkValid()
 	return f.headerFragBuf
 }
 
@@ -1530,7 +1395,7 @@ type http2MetaHeadersFrame struct {
 	// Truncated is whether the max header list size limit was hit
 	// and Fields is incomplete. The hpack decoder state is still
 	// valid, however.
-	Truncated bool
+	// Truncated bool
 }
 
 // PseudoValue returns the given pseudo header field's value.
@@ -1573,49 +1438,13 @@ func (mh *http2MetaHeadersFrame) PseudoFields() []hpack.HeaderField {
 // merge them into the provided hf and returns a MetaHeadersFrame
 // with the decoded hpack values.
 func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (http2Frame, error) {
-	if fr.AllowIllegalReads {
-		return nil, errors.New("illegal use of AllowIllegalReads with ReadMetaHeaders")
-	}
-
 	mh := &http2MetaHeadersFrame{
 		http2HeadersFrame: hf,
 	}
-	var remainSize = fr.maxHeaderListSize()
-	var sawRegular bool
-	var invalid error // pseudo header field errors
+
 	hdec := fr.ReadMetaHeaders
 	hdec.SetEmitEnabled(true)
 	hdec.SetEmitFunc(func(hf hpack.HeaderField) {
-		if !httpguts.ValidHeaderFieldValue(hf.Value) {
-			// Don't include the value in the error, because it may be sensitive.
-			invalid = fmt.Errorf("ValidHeaderFieldValue: %s", hf.Name)
-		}
-		isPseudo := strings.HasPrefix(hf.Name, ":")
-		if isPseudo {
-			if sawRegular {
-				invalid = errHttp2PseudoAfterRegular
-			}
-		} else {
-			sawRegular = true
-			if !http2validWireHeaderFieldName(hf.Name) {
-				invalid = fmt.Errorf("ValidHeaderFieldValue: %s", hf.Name)
-			}
-		}
-
-		if invalid != nil {
-			hdec.SetEmitEnabled(false)
-			return
-		}
-
-		size := hf.Size()
-		if size > remainSize {
-			hdec.SetEmitEnabled(false)
-			mh.Truncated = true
-			remainSize = 0
-			return
-		}
-		remainSize -= size
-
 		mh.Fields = append(mh.Fields, hf)
 	})
 	// Lose reference to MetaHeadersFrame:
@@ -1624,32 +1453,9 @@ func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (http2Frame, error) 
 	var hc http2headersOrContinuation = hf
 	for {
 		frag := hc.HeaderBlockFragment()
-
-		// Avoid parsing large amounts of headers that we will then discard.
-		// If the sender exceeds the max header list size by too much,
-		// skip parsing the fragment and close the connection.
-		//
-		// "Too much" is either any CONTINUATION frame after we've already
-		// exceeded the max header list size (in which case remainSize is 0),
-		// or a frame whose encoded size is more than twice the remaining
-		// header list bytes we're willing to accept.
-		if int64(len(frag)) > int64(2*remainSize) {
-			// It would be nice to send a RST_STREAM before sending the GOAWAY,
-			// but the structure of the server's frame writer makes this difficult.
-			return mh, http2ConnectionError(errHttp2CodeProtocol)
-		}
-		// Also close the connection after any CONTINUATION frame following an
-		// invalid header, since we stop tracking the size of the headers after
-		// an invalid one.
-		if invalid != nil {
-			// It would be nice to send a RST_STREAM before sending the GOAWAY,
-			// but the structure of the server's frame writer makes this difficult.
-			return mh, http2ConnectionError(errHttp2CodeProtocol)
-		}
 		if _, err := hdec.Write(frag); err != nil {
 			return mh, http2ConnectionError(errHttp2CodeCompression)
 		}
-
 		if hc.HeadersEnded() {
 			break
 		}
@@ -1661,14 +1467,8 @@ func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (http2Frame, error) 
 	}
 
 	mh.http2HeadersFrame.headerFragBuf = nil
-	mh.http2HeadersFrame.invalidate()
-
 	if err := hdec.Close(); err != nil {
 		return mh, http2ConnectionError(errHttp2CodeCompression)
-	}
-	if invalid != nil {
-		fr.errDetail = invalid
-		return nil, invalid
 	}
 	return mh, nil
 }
@@ -1846,30 +1646,6 @@ func (s http2SettingID) String() string {
 	return fmt.Sprintf("UNKNOWN_SETTING_%d", uint16(s))
 }
 
-// validWireHeaderFieldName reports whether v is a valid header field
-// name (key). See httpguts.ValidHeaderName for the base rules.
-//
-// Further, http2 says:
-//
-//	"Just as in HTTP/1.x, header field names are strings of ASCII
-//	characters that are compared in a case-insensitive
-//	fashion. However, header field names MUST be converted to
-//	lowercase prior to their encoding in HTTP/2. "
-func http2validWireHeaderFieldName(v string) bool {
-	if len(v) == 0 {
-		return false
-	}
-	for _, r := range v {
-		if !httpguts.IsTokenRune(r) {
-			return false
-		}
-		if 'A' <= r && r <= 'Z' {
-			return false
-		}
-	}
-	return true
-}
-
 func http2mustUint31(v int32) uint32 {
 	if v < 0 {
 		panic("out of range")
@@ -1939,10 +1715,9 @@ type Http2ClientConn struct {
 	flow              http2outflow // our conn-level flow control quota (cs.outflow is per stream)
 	inflow            http2inflow  // peer's conn-level flow control
 
-	nextStreamID          uint32
-	maxFrameSize          uint32
-	peerMaxHeaderListSize uint64
-	initialWindowSize     uint32
+	nextStreamID      uint32
+	maxFrameSize      uint32
+	initialWindowSize uint32
 
 	bw *bufio.Writer
 	fr *http2Framer
@@ -2099,21 +1874,20 @@ func spec2option(h2Ja3Spec ja3.H2Ja3Spec) gospiderOption {
 func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2ClientConn, error) {
 	ctx, cnl := context.WithCancel(context.TODO())
 	cc := &Http2ClientConn{
-		closeFunc:             closefun,
-		spec:                  spec2option(h2Ja3Spec),
-		ctx:                   ctx,
-		cnl:                   cnl,
-		tconn:                 c,
-		nextStreamID:          1,
-		maxFrameSize:          16 << 10,           // spec default
-		initialWindowSize:     65535,              // spec default
-		peerMaxHeaderListSize: 0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
+		closeFunc:         closefun,
+		spec:              spec2option(h2Ja3Spec),
+		ctx:               ctx,
+		cnl:               cnl,
+		tconn:             c,
+		nextStreamID:      1,
+		maxFrameSize:      16 << 10, // spec default
+		initialWindowSize: 65535,    // spec default
+		// peerMaxHeaderListSize: 0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
 	}
 	cc.flow.add(int32(cc.initialWindowSize))
 	cc.bw = bufio.NewWriter(c)
 	cc.fr = http2NewFramer(cc.bw, bufio.NewReader(c))
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(cc.spec.headerTableSize, nil)
-	cc.fr.MaxHeaderListSize = maxHeaderListSize
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(cc.spec.headerTableSize)
 	initialSettings := make([]http2Setting, len(cc.spec.initialSetting))
@@ -2157,32 +1931,6 @@ func (cc *Http2ClientConn) Close() error {
 	cc.tconn.Close()
 	cc.http2clientStream.headCnl()
 	return nil
-}
-
-// CanTakeNewRequest reports whether the connection can take a new request,
-// meaning it has not been closed or received or sent a GOAWAY.
-//
-// If the caller is going to immediately make a new request on this
-// connection, use ReserveNewRequest instead.
-
-// ClientConnState describes the state of a ClientConn.
-type Http2ClientConnState struct {
-
-	// StreamsActive is how many streams are active.
-
-	// StreamsReserved is how many streams have been reserved via
-	// ClientConn.ReserveNewRequest.
-	StreamsReserved int
-
-	// StreamsPending is how many requests have been sent in excess
-	// of the peer's advertised MaxConcurrentStreams setting and
-	// are waiting for other streams to complete.
-	StreamsPending int
-
-	// MaxConcurrentStreams is how many concurrent streams the
-	// peer advertised as acceptable. Zero means no SETTINGS
-	// frame has been received yet.
-	MaxConcurrentStreams uint32
 }
 
 func http2commaSeparatedTrailers(req *http.Request) (string, error) {
@@ -2634,10 +2382,6 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, con
 		hf := hpack.HeaderField{Name: name, Value: value}
 		hlSize += uint64(hf.Size())
 	})
-
-	if hlSize > cc.peerMaxHeaderListSize {
-		return nil, errHttp2RequestHeaderListSize
-	}
 	// Header list size is ok. Write the headers.
 	enumerateHeaders(func(name, value string) {
 		name, ascii := http2lowerHeader(name)
@@ -2676,7 +2420,6 @@ func http2shouldSendReqContentLength(method string, contentLength int64) bool {
 
 func (cc *Http2ClientConn) encodeTrailers(trailer http.Header) ([]byte, error) {
 	cc.hbuf.Reset()
-
 	hlSize := uint64(0)
 	for k, vv := range trailer {
 		for _, v := range vv {
@@ -2684,10 +2427,6 @@ func (cc *Http2ClientConn) encodeTrailers(trailer http.Header) ([]byte, error) {
 			hlSize += uint64(hf.Size())
 		}
 	}
-	if hlSize > cc.peerMaxHeaderListSize {
-		return nil, errHttp2RequestHeaderListSize
-	}
-
 	for k, vv := range trailer {
 		lowKey, ascii := http2lowerHeader(k)
 		if !ascii {
@@ -2719,13 +2458,7 @@ type http2clientConnReadLoop struct {
 }
 
 func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *http2MetaHeadersFrame) (*http.Response, error) {
-	if f.Truncated {
-		return nil, errHttp2ResponseHeaderListSize
-	}
 	status := f.PseudoValue("status")
-	if status == "" {
-		return nil, errors.New("malformed response from server: missing status pseudo header")
-	}
 	statusCode, err := strconv.Atoi(status)
 	if err != nil {
 		return nil, errors.New("malformed response from server: malformed non-numeric status pseudo header")
@@ -2873,7 +2606,6 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame)
 		case http2SettingMaxFrameSize: //MAX_FRAME_SIZE
 			cc.maxFrameSize = s.Val
 		case http2SettingMaxHeaderListSize: //MAX_HEADER_LIST_SIZE
-			cc.peerMaxHeaderListSize = uint64(s.Val)
 		case http2SettingInitialWindowSize: //INITIAL_WINDOW_SIZE
 			cc.initialWindowSize = s.Val
 		case http2SettingHeaderTableSize: //HEADER_TABLE_SIZE
@@ -2919,10 +2651,6 @@ func (rl *http2clientConnReadLoop) processPushPromise() error {
 	return http2ConnectionError(errHttp2CodeProtocol)
 }
 
-var (
-	errHttp2ResponseHeaderListSize = errors.New("http2: response header list larger than advertised limit")
-	errHttp2RequestHeaderListSize  = errors.New("http2: request header list larger than peer's advertised limit")
-)
 var http2noBody io.ReadCloser = http2noBodyReader{}
 
 type http2noBodyReader struct{}
