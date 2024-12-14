@@ -156,15 +156,7 @@ func http2takeInflows(f1, f2 *http2inflow, n uint32) bool {
 
 // outflow is the outbound flow control window's size.
 type http2outflow struct {
-	_ http2incomparable
-
-	// n is the number of DATA bytes we're allowed to send.
-	// An outflow is kept both on a conn and a per-stream.
-	n int32
-
-	// conn points to the shared connection-level outflow that is
-	// shared by all streams on that conn. It is nil for the outflow
-	// that's on the conn directly.
+	n    int32
 	conn *http2outflow
 }
 
@@ -179,9 +171,6 @@ func (f *http2outflow) available() int32 {
 }
 
 func (f *http2outflow) take(n int32) {
-	if n > f.available() {
-		panic("internal error: took too much")
-	}
 	f.n -= n
 	if f.conn != nil {
 		f.conn.n -= n
@@ -463,7 +452,7 @@ type http2Framer struct {
 	// countError is a non-nil func that's called on a frame parse
 	// error with some unique error path token. It's initialized
 	// from Transport.CountError or Server.CountError.
-	countError func(errToken string)
+	// countError func(errToken string)
 
 	// lastHeaderStream is non-zero if the last frame was an
 	// unfinished HEADERS/CONTINUATION.
@@ -576,9 +565,8 @@ func (fc *http2frameCache) getDataFrame() *http2DataFrame {
 // NewFramer returns a Framer that writes frames to w and reads them from r.
 func http2NewFramer(w io.Writer, r io.Reader) *http2Framer {
 	fr := &http2Framer{
-		w:          w,
-		r:          r,
-		countError: func(string) {},
+		w: w,
+		r: r,
 	}
 	fr.getReadBuf = func(size uint32) []byte {
 		if cap(fr.readBuf) >= int(size) {
@@ -621,7 +609,7 @@ func (fr *http2Framer) ReadFrame() (http2Frame, error) {
 	if _, err := io.ReadFull(fr.r, payload); err != nil {
 		return nil, err
 	}
-	f, err := http2typeFrameParser(fh.Type)(fr.frameCache, fh, fr.countError, payload)
+	f, err := http2typeFrameParser(fh.Type)(fr.frameCache, fh, nil, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -1569,27 +1557,16 @@ func http2canonicalHeader(v string) string {
 }
 
 const (
-	// ClientPreface is the string that must be sent by new
-	// connections from clients.
 	http2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-
-	// SETTINGS_MAX_FRAME_SIZE default
-	// https://httpwg.org/specs/rfc7540.html#rfc.section.6.5.2
-
-	// https://httpwg.org/specs/rfc7540.html#SettingValues
 )
 
 var (
 	http2clientPreface = []byte(http2ClientPreface)
 )
 
-// Setting is a setting parameter: which setting it is, and its value.
 type http2Setting struct {
-	// ID is which setting is being set.
-	// See https://httpwg.org/specs/rfc7540.html#SettingFormat
 	ID http2SettingID
 
-	// Val is the value.
 	Val uint32
 }
 
@@ -1653,38 +1630,10 @@ func http2mustUint31(v int32) uint32 {
 	return uint32(v)
 }
 
-// validPseudoPath reports whether v is a valid :path pseudo-header
-// value. It must be either:
-//
-//   - a non-empty string starting with '/'
-//   - the string '*', for OPTIONS requests.
-//
-// For now this is only used a quick check for deciding when to clean
-// up Opaque URLs before sending requests from the Transport.
-// See golang.org/issue/16847
-//
-// We used to enforce that the path also didn't start with "//", but
-// Google's GFE accepts such paths and Chrome sends them, so ignore
-// that part of the spec. See golang.org/issue/19103.
 func http2validPseudoPath(v string) bool {
 	return (len(v) > 0 && v[0] == '/') || v == "*"
 }
 
-// incomparable is a zero-width, non-comparable type. Adding it to a struct
-// makes that struct also non-comparable, and generally doesn't add
-// any size (as long as it's first).
-type http2incomparable [0]func()
-
-// stream represents a stream. This is the minimal metadata needed by
-// the serve goroutine. Most of the actual stream state is owned by
-// the http.Handler's goroutine in the responseWriter. Because the
-// responseWriter's responseWriterState is recycled at the end of a
-// handler, this struct intentionally has no pointer to the
-// *responseWriter{,State} itself, as the Handler ending nils out the
-// responseWriter's state field.
-
-// foreachHeaderElement splits v according to the "#rule" construction
-// in RFC 7230 section 7 and calls fn for each non-empty element.
 func http2foreachHeaderElement(v string, fn func(string)) {
 	v = textproto.TrimString(v)
 	if v == "" {
@@ -1744,7 +1693,7 @@ type http2clientStream struct {
 func (cc *Http2ClientConn) run() (err error) {
 	defer func() {
 		cc.err = err
-		cc.Close()
+		cc.CloseWithError(err)
 	}()
 	var f http2Frame
 	for {
@@ -1923,7 +1872,7 @@ func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2
 
 // SetDoNotReuse marks cc as not reusable for future HTTP requests.
 
-func (cc *Http2ClientConn) Close() error {
+func (cc *Http2ClientConn) CloseWithError(err error) error {
 	if cc.closeFunc != nil {
 		cc.closeFunc()
 	}
@@ -2627,6 +2576,9 @@ func (rl *http2clientConnReadLoop) processWindowUpdate(f *http2WindowUpdateFrame
 	return nil
 }
 func (rl *http2clientConnReadLoop) processResetStream(f *http2RSTStreamFrame) error {
+	if f.ErrCode == 0 {
+		return nil
+	}
 	return fmt.Errorf("stream error: %v", f.ErrCode)
 }
 func (cc *Http2ClientConn) Ping(ctx context.Context) error {
