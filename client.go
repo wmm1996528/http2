@@ -1710,7 +1710,7 @@ func (cc *Http2ClientConn) run() (err error) {
 			}
 			cc.http2clientStream.headCnl()
 		case *http2DataFrame:
-			if _, err = cc.loop.processData(cc.http2clientStream, f); err != nil {
+			if err = cc.loop.processData(cc.http2clientStream, f); err != nil {
 				return tools.WrapError(err, "processData")
 			}
 		case *http2GoAwayFrame:
@@ -1883,6 +1883,8 @@ func (cc *Http2ClientConn) CloseWithError(err error) error {
 	cc.tconn.Close()
 	if cc.http2clientStream != nil {
 		cc.http2clientStream.headCnl()
+		cc.http2clientStream.bodyReader.CloseWithError(err)
+		cc.http2clientStream.bodyWriter.CloseWithError(err)
 	}
 	return nil
 }
@@ -2500,22 +2502,20 @@ func (b http2transportResponseBody) Read(p []byte) (n int, err error) {
 func (b http2transportResponseBody) Close() error {
 	return b.cs.bodyReader.Close()
 }
-func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2DataFrame) (bool, error) {
+func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2DataFrame) error {
 	cc := rl.cc
 	data := f.Data()
 	if f.Length > 0 {
 		if !http2takeInflows(&cc.inflow, &cs.inflow, f.Length) {
-			return false, http2ConnectionError(errHttp2CodeFlowControl)
+			return http2ConnectionError(errHttp2CodeFlowControl)
 		}
-		// Return any padded flow control now, since we won't
-		// refund it later on body reads.
 		var refund int
 		if pad := int(f.Length) - len(data); pad > 0 {
 			refund += pad
 		}
 		if len(data) > 0 {
 			if _, err := cs.bodyWriter.Write(data); err != nil {
-				return false, err
+				return err
 			}
 		}
 		sendConn := cc.inflow.add(refund)
@@ -2530,11 +2530,10 @@ func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2Da
 			cc.bw.Flush()
 		}
 	}
-	isEnd := f.StreamEnded()
-	if isEnd {
+	if f.StreamEnded() {
 		cs.bodyWriter.CloseWithError(io.EOF)
 	}
-	return isEnd, nil
+	return nil
 }
 func (rl *http2clientConnReadLoop) processGoAway(f *http2GoAwayFrame) error {
 	if f.ErrCode == 0 {
