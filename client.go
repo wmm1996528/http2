@@ -1702,6 +1702,9 @@ func (cc *Http2ClientConn) run() (err error) {
 		}
 		switch f := f.(type) {
 		case *http2MetaHeadersFrame:
+			if cc.http2clientStream == nil {
+				return tools.WrapError(errors.New("unexpected meta headers frame"), "run")
+			}
 			if cc.http2clientStream.resp, err = cc.loop.handleResponse(cc.http2clientStream, f); err != nil {
 				return tools.WrapError(err, "handleResponse")
 			}
@@ -1878,7 +1881,9 @@ func (cc *Http2ClientConn) CloseWithError(err error) error {
 	}
 	cc.cnl()
 	cc.tconn.Close()
-	cc.http2clientStream.headCnl()
+	if cc.http2clientStream != nil {
+		cc.http2clientStream.headCnl()
+	}
 	return nil
 }
 
