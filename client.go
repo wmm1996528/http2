@@ -1657,12 +1657,11 @@ type Http2ClientConn struct {
 	spec              gospiderOption
 	loop              *http2clientConnReadLoop
 	http2clientStream *http2clientStream
-	ctx               context.Context
-	cnl               context.CancelFunc
-	err               error
-	tconn             net.Conn     // usually *tls.Conn, except specialized impls
-	flow              http2outflow // our conn-level flow control quota (cs.outflow is per stream)
-	inflow            http2inflow  // peer's conn-level flow control
+
+	err    error
+	tconn  net.Conn     // usually *tls.Conn, except specialized impls
+	flow   http2outflow // our conn-level flow control quota (cs.outflow is per stream)
+	inflow http2inflow  // peer's conn-level flow control
 
 	nextStreamID      uint32
 	maxFrameSize      uint32
@@ -1823,18 +1822,14 @@ func spec2option(h2Ja3Spec ja3.H2Ja3Spec) gospiderOption {
 		maxHeaderListSize: maxHeaderListSize,
 	}
 }
-func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2ClientConn, error) {
-	ctx, cnl := context.WithCancel(context.TODO())
+func NewClientConn(ctx context.Context, c net.Conn, h2Ja3Spec ja3.H2Ja3Spec, closefun func()) (*Http2ClientConn, error) {
 	cc := &Http2ClientConn{
 		closeFunc:         closefun,
 		spec:              spec2option(h2Ja3Spec),
-		ctx:               ctx,
-		cnl:               cnl,
 		tconn:             c,
 		nextStreamID:      1,
 		maxFrameSize:      16 << 10, // spec default
 		initialWindowSize: 65535,    // spec default
-		// peerMaxHeaderListSize: 0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
 	}
 	cc.flow.add(int32(cc.initialWindowSize))
 	cc.bw = bufio.NewWriter(c)
@@ -1846,27 +1841,31 @@ func NewClientConn(closefun func(), c net.Conn, h2Ja3Spec ja3.H2Ja3Spec) (*Http2
 	for i, setting := range cc.spec.initialSetting {
 		initialSettings[i] = http2Setting{ID: http2SettingID(setting.Id), Val: setting.Val}
 	}
-
-	// initialSettings := []http2Setting{
-	// 	// {ID: http2SettingEnablePush, Val: 0},
-	// 	{ID: http2SettingInitialWindowSize, Val: 4194304},
-	// }
-	// initialSettings = append(initialSettings, http2Setting{ID: http2SettingMaxFrameSize, Val: 16384})
-	// initialSettings = append(initialSettings, http2Setting{ID: http2SettingMaxHeaderListSize, Val: 10 << 20})
-	// initialSettings = append(initialSettings, http2Setting{ID: http2SettingHeaderTableSize, Val: 4096})
-
-	if _, err := cc.bw.Write(http2clientPreface); err != nil {
-		return nil, err
-	}
-	if err := cc.fr.WriteSettings(initialSettings...); err != nil {
-		return nil, err
-	}
-	if err := cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
-		return nil, err
-	}
-	cc.inflow.init(int32(cc.spec.connFlow) + int32(cc.initialWindowSize))
-	if err := cc.bw.Flush(); err != nil {
-		return nil, err
+	done := make(chan struct{})
+	var err error
+	go func() {
+		defer close(done)
+		if _, err = cc.bw.Write(http2clientPreface); err != nil {
+			return
+		}
+		if err = cc.fr.WriteSettings(initialSettings...); err != nil {
+			return
+		}
+		if err = cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
+			return
+		}
+		cc.inflow.init(int32(cc.spec.connFlow) + int32(cc.initialWindowSize))
+		if err = cc.bw.Flush(); err != nil {
+			return
+		}
+	}()
+	select {
+	case <-done:
+		if err != nil {
+			return nil, err
+		}
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
 	}
 	cc.loop = &http2clientConnReadLoop{cc: cc}
 	go cc.run()
@@ -1879,7 +1878,6 @@ func (cc *Http2ClientConn) CloseWithError(err error) error {
 	if cc.closeFunc != nil {
 		cc.closeFunc()
 	}
-	cc.cnl()
 	cc.tconn.Close()
 	if cc.http2clientStream != nil {
 		cc.http2clientStream.headCnl()
@@ -1957,11 +1955,6 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 			return nil, cc.err
 		}
 		return nil, ctx.Err()
-	case <-cc.ctx.Done():
-		if cc.err != nil {
-			return nil, cc.err
-		}
-		return nil, cc.ctx.Err()
 	}
 }
 

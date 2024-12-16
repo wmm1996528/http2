@@ -18,7 +18,7 @@ require (
 	github.com/caddyserver/zerossl v0.1.3 // indirect
 	github.com/cloudflare/circl v1.5.0 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
-	github.com/gospider007/gtls v0.0.0-20240527084326-e580531eb89e // indirect
+	github.com/gospider007/gtls v0.0.0-20241216053748-dc1a232bb017 // indirect
 	github.com/gospider007/kinds v0.0.0-20240929092451-8f867acde255 // indirect
 	github.com/gospider007/re v0.0.0-20240227100911-e27255e48eff // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -29,7 +29,7 @@ require (
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/libdns/libdns v0.2.2 // indirect
 	github.com/mholt/acmez/v2 v2.0.3 // indirect
-	github.com/mholt/archives v0.0.0-20241207175349-5e373c52f8aa // indirect
+	github.com/mholt/archives v0.0.0-20241216060121-23e0af8fe73d // indirect
 	github.com/miekg/dns v1.1.62 // indirect
 	github.com/nwaples/rardecode/v2 v2.0.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
@@ -42,7 +42,7 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	go4.org v0.0.0-20230225012048-214862532bf5 // indirect
 	golang.org/x/crypto v0.31.0 // indirect
-	golang.org/x/exp v0.0.0-20241210194714-1829a127f884 // indirect
+	golang.org/x/exp v0.0.0-20241215155358-4a5509556b9e // indirect
 	golang.org/x/image v0.23.0 // indirect
 	golang.org/x/mod v0.22.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
