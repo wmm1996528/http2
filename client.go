@@ -183,9 +183,10 @@ func (f *http2outflow) add(n int32) bool {
 	sum := f.n + n
 	if (sum > n) == (f.n > 0) {
 		f.n = sum
-		return true
+	} else {
+		f.n = n
 	}
-	return false
+	return true
 }
 
 const http2frameHeaderLen = 9
@@ -1875,7 +1876,7 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Ja3Spec ja3.H2Ja3Spec, clo
 // SetDoNotReuse marks cc as not reusable for future HTTP requests.
 
 func (cc *Http2ClientConn) CloseWithError(err error) error {
-	if cc.closeFunc != nil {
+	if err != io.EOF && cc.closeFunc != nil {
 		cc.closeFunc()
 	}
 	cc.tconn.Close()
@@ -2569,6 +2570,9 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame)
 }
 func (rl *http2clientConnReadLoop) processWindowUpdate(f *http2WindowUpdateFrame) error {
 	fl := &rl.cc.flow
+	if rl.cc.http2clientStream != nil {
+		fl = &rl.cc.http2clientStream.flow
+	}
 	if !fl.add(int32(f.Increment)) {
 		return http2ConnectionError(errHttp2CodeFlowControl)
 	}
