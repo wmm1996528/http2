@@ -1777,13 +1777,13 @@ func clearOrderHeaders(headers []string) []string {
 	}
 	return orderHeaders
 }
-func spec2option(h2Ja3Spec ja3.H2Ja3Spec) gospiderOption {
+func spec2option(h2Spec ja3.H2Spec) gospiderOption {
 	var headerTableSize uint32 = 65536
 	var maxHeaderListSize uint32 = 262144
 	var streamFlow uint32 = 6291456
 
-	if h2Ja3Spec.InitialSetting != nil {
-		for _, setting := range h2Ja3Spec.InitialSetting {
+	if h2Spec.InitialSetting != nil {
+		for _, setting := range h2Spec.InitialSetting {
 			switch setting.Id {
 			case 1:
 				headerTableSize = setting.Val
@@ -1794,7 +1794,7 @@ func spec2option(h2Ja3Spec ja3.H2Ja3Spec) gospiderOption {
 			}
 		}
 	} else {
-		h2Ja3Spec.InitialSetting = []ja3.Setting{
+		h2Spec.InitialSetting = []ja3.Setting{
 			{Id: 1, Val: headerTableSize},
 			{Id: 2, Val: 0},
 			{Id: 3, Val: 1000},
@@ -1802,31 +1802,31 @@ func spec2option(h2Ja3Spec ja3.H2Ja3Spec) gospiderOption {
 			{Id: 6, Val: maxHeaderListSize},
 		}
 	}
-	if !h2Ja3Spec.Priority.Exclusive && h2Ja3Spec.Priority.StreamDep == 0 && h2Ja3Spec.Priority.Weight == 0 {
-		h2Ja3Spec.Priority = ja3.Priority{
+	if !h2Spec.Priority.Exclusive && h2Spec.Priority.StreamDep == 0 && h2Spec.Priority.Weight == 0 {
+		h2Spec.Priority = ja3.Priority{
 			Exclusive: true,
 			StreamDep: 0,
 			Weight:    255,
 		}
 	}
-	if h2Ja3Spec.ConnFlow == 0 {
-		h2Ja3Spec.ConnFlow = 15663105
+	if h2Spec.ConnFlow == 0 {
+		h2Spec.ConnFlow = 15663105
 	}
-	h2Ja3Spec.OrderHeaders = clearOrderHeaders(h2Ja3Spec.OrderHeaders)
+	h2Spec.OrderHeaders = clearOrderHeaders(h2Spec.OrderHeaders)
 	return gospiderOption{
-		orderHeaders:      h2Ja3Spec.OrderHeaders,
-		initialSetting:    h2Ja3Spec.InitialSetting,
-		priority:          h2Ja3Spec.Priority,
+		orderHeaders:      h2Spec.OrderHeaders,
+		initialSetting:    h2Spec.InitialSetting,
+		priority:          h2Spec.Priority,
 		streamFlow:        streamFlow,
-		connFlow:          h2Ja3Spec.ConnFlow,
+		connFlow:          h2Spec.ConnFlow,
 		headerTableSize:   headerTableSize,
 		maxHeaderListSize: maxHeaderListSize,
 	}
 }
-func NewClientConn(ctx context.Context, c net.Conn, h2Ja3Spec ja3.H2Ja3Spec, closefun func()) (*Http2ClientConn, error) {
+func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.H2Spec, closefun func()) (*Http2ClientConn, error) {
 	cc := &Http2ClientConn{
 		closeFunc:         closefun,
-		spec:              spec2option(h2Ja3Spec),
+		spec:              spec2option(h2Spec),
 		tconn:             c,
 		nextStreamID:      1,
 		maxFrameSize:      16 << 10, // spec default
