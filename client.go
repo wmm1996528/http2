@@ -40,7 +40,6 @@ func http2asciiEqualFold(s, t string) bool {
 	return true
 }
 
-// lower returns the ASCII lowercase version of b.
 func http2lower(b byte) byte {
 	if 'A' <= b && b <= 'Z' {
 		return b + ('a' - 'A')
@@ -108,85 +107,15 @@ type http2inflow struct {
 	unsent int32
 }
 
-// init sets the initial window.
-func (f *http2inflow) init(n int32) {
-	f.avail = n
-}
-
-// add adds n bytes to the window, with a maximum window size of max,
-// indicating that the peer can now send us more data.
-// For example, the user read from a {Request,Response} body and consumed
-// some of the buffered data, so the peer can now send more.
-// It returns the number of bytes to send in a WINDOW_UPDATE frame to the peer.
-// Window updates are accumulated and sent when the unsent capacity
-// is at least inflowMinRefresh or will at least double the peer's available window.
 func (f *http2inflow) add(n int) (connAdd int32) {
-	if n < 0 {
-		panic("negative update")
-	}
 	unsent := int64(f.unsent) + int64(n)
-	// "A sender MUST NOT allow a flow-control window to exceed 2^31-1 octets."
-	// RFC 7540 Section 6.9.1.
-	const maxWindow = 1<<31 - 1
-	if unsent+int64(f.avail) > maxWindow {
-		panic("flow control update exceeds maximum window size")
-	}
 	f.unsent = int32(unsent)
 	if f.unsent < http2inflowMinRefresh && f.unsent < f.avail {
-		// If there aren't at least inflowMinRefresh bytes of window to send,
-		// and this update won't at least double the window, buffer the update for later.
 		return 0
 	}
 	f.avail += f.unsent
 	f.unsent = 0
 	return int32(unsent)
-}
-
-// takeInflows attempts to take n bytes from two inflows,
-// typically connection-level and stream-level flows.
-// It reports whether both windows have available capacity.
-func http2takeInflows(f1, f2 *http2inflow, n uint32) bool {
-	if n > uint32(f1.avail) || n > uint32(f2.avail) {
-		return false
-	}
-	f1.avail -= int32(n)
-	f2.avail -= int32(n)
-	return true
-}
-
-// outflow is the outbound flow control window's size.
-type http2outflow struct {
-	n    int32
-	conn *http2outflow
-}
-
-func (f *http2outflow) setConnFlow(cf *http2outflow) { f.conn = cf }
-
-func (f *http2outflow) available() int32 {
-	n := f.n
-	if f.conn != nil && f.conn.n < n {
-		n = f.conn.n
-	}
-	return n
-}
-
-func (f *http2outflow) take(n int32) {
-	f.n -= n
-	if f.conn != nil {
-		f.conn.n -= n
-	}
-}
-
-// add adds n bytes (positive or negative) to the flow control window.
-// It returns false if the sum would exceed 2^31-1.
-func (f *http2outflow) add(n int32) bool {
-	sum := f.n + n
-	if (sum > n) == (f.n > 0) {
-		f.n = sum
-	} else {
-		f.n = n
-	}
-	return true
 }
 
 const http2frameHeaderLen = 9
@@ -840,11 +769,6 @@ func (f *http2SettingsFrame) ForeachSetting(fn func(http2Setting) error) error {
 	return nil
 }
 
-// WriteSettings writes a SETTINGS frame with zero or more settings
-// specified and the ACK bit not set.
-//
-// It will perform exactly one Write to the underlying Writer.
-// It is the caller's responsibility to not call other Write methods concurrently.
 func (f *http2Framer) WriteSettings(settings ...http2Setting) error {
 	f.startWrite(http2FrameSettings, 0, 0)
 	for _, s := range settings {
@@ -863,10 +787,6 @@ func (f *http2Framer) WriteSettingsAck() error {
 	return f.endWrite()
 }
 
-// A PingFrame is a mechanism for measuring a minimal round trip time
-// from the sender, as well as determining whether an idle connection
-// is still functional.
-// See https://httpwg.org/specs/rfc7540.html#rfc.section.6.7
 type http2PingFrame struct {
 	http2FrameHeader
 	Data [8]byte
@@ -907,14 +827,6 @@ type http2GoAwayFrame struct {
 	debugData    []byte
 }
 
-// DebugData returns any debug data in the GOAWAY frame. Its contents
-// are not defined.
-// The caller must not retain the returned memory past the next
-// call to ReadFrame.
-func (f *http2GoAwayFrame) DebugData() []byte {
-	return f.debugData
-}
-
 func http2parseGoAwayFrame(_ *http2frameCache, fh http2FrameHeader, countError func(string), p []byte) (http2Frame, error) {
 	if fh.StreamID != 0 {
 		countError("frame_goaway_has_stream")
@@ -930,14 +842,6 @@ func http2parseGoAwayFrame(_ *http2frameCache, fh http2FrameHeader, countError f
 		ErrCode:          errHttp2Code(binary.BigEndian.Uint32(p[4:8])),
 		debugData:        p[8:],
 	}, nil
-}
-
-func (f *http2Framer) WriteGoAway(maxStreamID uint32, code errHttp2Code, debugData []byte) error {
-	f.startWrite(http2FrameGoAway, 0, 0)
-	f.writeUint32(maxStreamID & (1<<31 - 1))
-	f.writeUint32(uint32(code))
-	f.writeBytes(debugData)
-	return f.endWrite()
 }
 
 // An UnknownFrame is the frame type returned when the frame type is unknown
@@ -1624,13 +1528,6 @@ func (s http2SettingID) String() string {
 	return fmt.Sprintf("UNKNOWN_SETTING_%d", uint16(s))
 }
 
-func http2mustUint31(v int32) uint32 {
-	if v < 0 {
-		panic("out of range")
-	}
-	return uint32(v)
-}
-
 func http2validPseudoPath(v string) bool {
 	return (len(v) > 0 && v[0] == '/') || v == "*"
 }
@@ -1660,9 +1557,8 @@ type Http2ClientConn struct {
 	http2clientStream *http2clientStream
 
 	err    error
-	tconn  net.Conn     // usually *tls.Conn, except specialized impls
-	flow   http2outflow // our conn-level flow control quota (cs.outflow is per stream)
-	inflow http2inflow  // peer's conn-level flow control
+	tconn  net.Conn    // usually *tls.Conn, except specialized impls
+	inflow http2inflow // peer's conn-level flow control
 
 	nextStreamID      uint32
 	maxFrameSize      uint32
@@ -1684,9 +1580,6 @@ type http2clientStream struct {
 	ID                   uint32
 	bodyReader           *io.PipeReader
 	bodyWriter           *io.PipeWriter
-	flow                 http2outflow // guarded by cc.mu
-	inflow               http2inflow  // guarded by cc.mu
-	reqBody              io.ReadCloser
 	reqBodyContentLength int64 // -1 means unknown
 }
 
@@ -1730,9 +1623,9 @@ func (cc *Http2ClientConn) run() (err error) {
 				return tools.WrapError(err, "processPushPromise")
 			}
 		case *http2WindowUpdateFrame:
-			if err = cc.loop.processWindowUpdate(f); err != nil {
-				return tools.WrapError(err, "processWindowUpdate")
-			}
+			// if err = cc.loop.processWindowUpdate(f); err != nil {
+			// 	return tools.WrapError(err, "processWindowUpdate")
+			// }
 		case *http2PingFrame:
 			if err = cc.loop.processPing(f); err != nil {
 				return tools.WrapError(err, "processPing")
@@ -1832,7 +1725,6 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.H2Spec, closefun 
 		maxFrameSize:      16 << 10, // spec default
 		initialWindowSize: 65535,    // spec default
 	}
-	cc.flow.add(int32(cc.initialWindowSize))
 	cc.bw = bufio.NewWriter(c)
 	cc.fr = http2NewFramer(cc.bw, bufio.NewReader(c))
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(cc.spec.headerTableSize, nil)
@@ -1855,7 +1747,7 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.H2Spec, closefun 
 		if err = cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
 			return
 		}
-		cc.inflow.init(int32(cc.spec.connFlow) + int32(cc.initialWindowSize))
+		cc.inflow.avail = int32(cc.spec.connFlow) + int32(cc.initialWindowSize)
 		if err = cc.bw.Flush(); err != nil {
 			return
 		}
@@ -1932,7 +1824,6 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 		ctx:                  ctx,
 		headCtx:              headCtx,
 		headCnl:              headCnl,
-		reqBody:              req.Body,
 		reqBodyContentLength: http2actualContentLength(req),
 		bodyReader:           reader,
 		bodyWriter:           writer,
@@ -1942,8 +1833,8 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 	if err != nil {
 		return nil, err
 	}
-	if cs.reqBody != nil {
-		defer cs.reqBody.Close()
+	if req.Body != nil {
+		defer req.Body.Close()
 	}
 	select {
 	case <-cs.headCtx.Done():
@@ -2030,16 +1921,6 @@ func (cc *Http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFram
 	return cc.bw.Flush()
 }
 
-// internal error values; they don't escape to callers
-var (
-	errHttp2ReqBodyTooLong = errors.New("http2: request body larger than specified content length")
-)
-
-// frameScratchBufferLen returns the length of a buffer to use for
-// outgoing request bodies to read/write to/from.
-//
-// It returns max(1, min(peer's advertised max frame size,
-// Request.ContentLength+1, 512KB)).
 func (cs *http2clientStream) frameScratchBufferLen(maxFrameSize int) int {
 	const max = 512 << 10
 	n := int64(maxFrameSize)
@@ -2069,20 +1950,9 @@ func http2bufPoolIndex(size int) int {
 	}
 	return index
 }
-
 func (cs *http2clientStream) writeRequestBody(req *http.Request) (err error) {
-	cc := cs.cc
-	body := cs.reqBody
 	sentEnd := false // whether we sent the final DATA frame w/ END_STREAM
-
-	hasTrailers := req.Trailer != nil
-	remainLen := cs.reqBodyContentLength
-	hasContentLen := remainLen != -1
-
-	maxFrameSize := int(cc.maxFrameSize)
-
-	// Scratch buffer for reading into & writing from.
-	scratchLen := cs.frameScratchBufferLen(maxFrameSize)
+	scratchLen := cs.frameScratchBufferLen(int(cs.cc.maxFrameSize))
 	var buf []byte
 	index := http2bufPoolIndex(scratchLen)
 	if bp, ok := http2bufPools[index].Get().(*[]byte); ok && len(*bp) >= scratchLen {
@@ -2094,119 +1964,50 @@ func (cs *http2clientStream) writeRequestBody(req *http.Request) (err error) {
 	}
 	var sawEOF bool
 	for !sawEOF {
-		n, err := body.Read(buf)
-		if hasContentLen {
-			remainLen -= int64(n)
-			if remainLen == 0 && err == nil {
-				var scratch [1]byte
-				var n1 int
-				n1, err = body.Read(scratch[:])
-				remainLen -= int64(n1)
-			}
-			if remainLen < 0 {
-				err = errHttp2ReqBodyTooLong
-				return err
-			}
-		}
+		n, err := req.Body.Read(buf)
 		if err != nil {
-			switch {
-			case err == io.EOF:
+			if err == io.EOF {
 				sawEOF = true
 				err = nil
-			default:
+			} else {
 				return err
 			}
 		}
-
-		remain := buf[:n]
-		for len(remain) > 0 && err == nil {
-			var allowed int32
-			allowed, err = cs.awaitFlowControl(len(remain))
-			if err != nil {
-				return err
-			}
-			data := remain[:allowed]
-			remain = remain[allowed:]
-			sentEnd = sawEOF && len(remain) == 0 && !hasTrailers
-			err = cc.fr.WriteData(cs.ID, sentEnd, data)
+		if n > 0 {
+			sentEnd = sawEOF && req.Trailer == nil
+			err = cs.cc.fr.WriteData(cs.ID, sentEnd, buf[:n])
 			if err == nil {
-				err = cc.bw.Flush()
+				err = cs.cc.bw.Flush()
 			}
 		}
 		if err != nil {
 			return err
 		}
 	}
-
 	if sentEnd {
 		return nil
 	}
-	trailer := req.Trailer
-	// err = cs.abortErr
-	if err != nil {
-		return err
-	}
 	var trls []byte
-	if len(trailer) > 0 {
-		trls, err = cc.encodeTrailers(trailer)
+	if len(req.Trailer) > 0 {
+		trls, err = cs.cc.encodeTrailers(req.Trailer)
 		if err != nil {
 			return err
 		}
 	}
-
 	if len(trls) > 0 {
-		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls)
+		err = cs.cc.writeHeaders(cs.ID, true, int(cs.cc.maxFrameSize), trls)
 	} else {
-		err = cc.fr.WriteData(cs.ID, true, nil)
+		err = cs.cc.fr.WriteData(cs.ID, true, nil)
 	}
-	if ferr := cc.bw.Flush(); ferr != nil && err == nil {
-		err = ferr
+	if err != nil {
+		return err
 	}
-	return err
+	return cs.cc.bw.Flush()
 }
-
-func (cs *http2clientStream) awaitFlowControl(maxBytes int) (taken int32, err error) {
-	cc := cs.cc
-	for {
-		if a := cs.flow.available(); a > 0 {
-			take := a
-			if int(take) > maxBytes {
-
-				take = int32(maxBytes) // can't truncate int; take is int32
-			}
-			if take > int32(cc.maxFrameSize) {
-				take = int32(cc.maxFrameSize)
-			}
-			cs.flow.take(take)
-			return take, nil
-		}
-	}
-}
-func http2validateHeaders(hdrs http.Header) string {
-	for k, vv := range hdrs {
-		if !httpguts.ValidHeaderFieldName(k) {
-			return fmt.Sprintf("name %q", k)
-		}
-		for _, v := range vv {
-			if !httpguts.ValidHeaderFieldValue(v) {
-				// Don't include the value in the error,
-				// because it may be sensitive.
-				return fmt.Sprintf("value for header %q", k)
-			}
-		}
-	}
-	return ""
-}
-
-var errHttp2NilRequestURL = errors.New("http2: Request.URI is nil")
 
 // requires cc.wmu be held.
 func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, contentLength int64, orderHeaders []string) ([]byte, error) {
 	cc.hbuf.Reset()
-	if req.URL == nil {
-		return nil, errHttp2NilRequestURL
-	}
-
 	host := req.Host
 	if host == "" {
 		host = req.URL.Host
@@ -2215,36 +2016,14 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, con
 	if err != nil {
 		return nil, err
 	}
-	if !httpguts.ValidHostHeader(host) {
-		return nil, errors.New("http2: invalid Host header")
-	}
 
 	var path string
 	if req.Method != "CONNECT" {
 		path = req.URL.RequestURI()
 		if !http2validPseudoPath(path) {
-			orig := path
 			path = strings.TrimPrefix(path, req.URL.Scheme+"://"+host)
-			if !http2validPseudoPath(path) {
-				if req.URL.Opaque != "" {
-					return nil, fmt.Errorf("invalid request :path %q from URL.Opaque = %q", orig, req.URL.Opaque)
-				} else {
-					return nil, fmt.Errorf("invalid request :path %q", orig)
-				}
-			}
 		}
 	}
-
-	// Check for any invalid headers+trailers and return an error before we
-	// potentially pollute our hpack state. (We want to be able to
-	// continue to reuse the hpack encoder for future requests)
-	if err := http2validateHeaders(req.Header); err != "" {
-		return nil, fmt.Errorf("invalid HTTP header %s", err)
-	}
-	if err := http2validateHeaders(req.Trailer); err != "" {
-		return nil, fmt.Errorf("invalid HTTP trailer %s", err)
-	}
-
 	enumerateHeaders := func(replaceF func(name, value string)) {
 		gospiderHeaders := map[string][]string{}
 		f := func(name, value string) {
@@ -2348,11 +2127,6 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, con
 	return cc.hbuf.Bytes(), nil
 }
 
-// shouldSendReqContentLength reports whether the http2.Transport should send
-// a "content-length" request header. This logic is basically a copy of the net/http
-// transferWriter.shouldSendContentLength.
-// The contentLength is the corrected contentLength (so 0 means actually 0, not unknown).
-// -1 means unknown.
 func http2shouldSendReqContentLength(method string, contentLength int64) bool {
 	if contentLength > 0 {
 		return true
@@ -2397,9 +2171,7 @@ func (cc *Http2ClientConn) writeHeader(name, value string) {
 
 // requires cc.mu be held.
 func (cc *Http2ClientConn) addStreamLocked(cs *http2clientStream) {
-	cs.flow.add(int32(cc.initialWindowSize))
-	cs.flow.setConnFlow(&cc.flow)
-	cs.inflow.init(int32(cc.spec.streamFlow))
+	cs.cc.inflow.avail = int32(cc.spec.streamFlow)
 	cs.ID = cc.nextStreamID
 	cc.nextStreamID += 2
 }
@@ -2473,27 +2245,7 @@ type http2transportResponseBody struct {
 }
 
 func (b http2transportResponseBody) Read(p []byte) (n int, err error) {
-	cs := b.cs
-	cc := cs.cc
-	n, err = b.cs.bodyReader.Read(p)
-	if n == 0 {
-		return
-	}
-	connAdd := cc.inflow.add(n)
-	var streamAdd int32
-	if err == nil { // No need to refresh if the stream is over or failed.
-		streamAdd = cs.inflow.add(n)
-	}
-	if connAdd != 0 || streamAdd != 0 {
-		if connAdd != 0 {
-			cc.fr.WriteWindowUpdate(0, http2mustUint31(connAdd))
-		}
-		if streamAdd != 0 {
-			cc.fr.WriteWindowUpdate(cs.ID, http2mustUint31(streamAdd))
-		}
-		cc.bw.Flush()
-	}
-	return
+	return b.cs.bodyReader.Read(p)
 }
 func (b http2transportResponseBody) Close() error {
 	return b.cs.bodyReader.Close()
@@ -2502,9 +2254,6 @@ func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2Da
 	cc := rl.cc
 	data := f.Data()
 	if f.Length > 0 {
-		if !http2takeInflows(&cc.inflow, &cs.inflow, f.Length) {
-			return http2ConnectionError(errHttp2CodeFlowControl)
-		}
 		var refund int
 		if pad := int(f.Length) - len(data); pad > 0 {
 			refund += pad
@@ -2515,14 +2264,8 @@ func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2Da
 			}
 		}
 		sendConn := cc.inflow.add(refund)
-		sendStream := cs.inflow.add(refund)
-		if sendConn > 0 || sendStream > 0 {
-			if sendConn > 0 {
-				cc.fr.WriteWindowUpdate(0, uint32(sendConn))
-			}
-			if sendStream > 0 {
-				cc.fr.WriteWindowUpdate(cs.ID, uint32(sendStream))
-			}
+		if sendConn > 0 {
+			cc.fr.WriteWindowUpdate(cs.ID, uint32(sendConn))
 			cc.bw.Flush()
 		}
 	}
@@ -2568,16 +2311,7 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame)
 	}
 	return nil
 }
-func (rl *http2clientConnReadLoop) processWindowUpdate(f *http2WindowUpdateFrame) error {
-	fl := &rl.cc.flow
-	if rl.cc.http2clientStream != nil {
-		fl = &rl.cc.http2clientStream.flow
-	}
-	if !fl.add(int32(f.Increment)) {
-		return http2ConnectionError(errHttp2CodeFlowControl)
-	}
-	return nil
-}
+
 func (rl *http2clientConnReadLoop) processResetStream(f *http2RSTStreamFrame) error {
 	if f.ErrCode == 0 {
 		return nil
