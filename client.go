@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/textproto"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1464,23 +1463,6 @@ func (cc *Http2ClientConn) CloseWithError(err error) error {
 	return nil
 }
 
-func http2commaSeparatedTrailers(req *http.Request) (string, error) {
-	keys := make([]string, 0, len(req.Trailer))
-	for k := range req.Trailer {
-		k = http2canonicalHeader(k)
-		switch k {
-		case "Transfer-Encoding", "Trailer", "Content-Length":
-			return "", fmt.Errorf("invalid Trailer key %q", k)
-		}
-		keys = append(keys, k)
-	}
-	if len(keys) > 0 {
-		sort.Strings(keys)
-		return strings.Join(keys, ","), nil
-	}
-	return "", nil
-}
-
 func http2actualContentLength(req *http.Request) int64 {
 	if req.Body == nil || req.Body == http.NoBody {
 		return 0
@@ -1548,20 +1530,11 @@ func (cs *http2clientStream) writeRequest(req *http.Request, orderHeaders []stri
 
 func (cs *http2clientStream) encodeAndWriteHeaders(req *http.Request, orderHeaders []string) error {
 	cc := cs.cc
-	trailers, err := http2commaSeparatedTrailers(req)
+	hdrs, err := cc.encodeHeaders(req, orderHeaders)
 	if err != nil {
 		return err
 	}
-	hasTrailers := trailers != ""
-	contentLen := http2actualContentLength(req)
-	hasBody := contentLen != 0
-	hdrs, err := cc.encodeHeaders(req, trailers, contentLen, orderHeaders)
-	if err != nil {
-		return err
-	}
-
-	endStream := !hasBody && !hasTrailers
-	err = cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	err = cc.writeHeaders(cs.ID, http2actualContentLength(req) == 0, int(cc.maxFrameSize), hdrs)
 	return err
 }
 
@@ -1610,8 +1583,7 @@ func (cs *http2clientStream) frameScratchBufferLen(maxFrameSize int) int {
 }
 
 func (cs *http2clientStream) writeRequestBody(req *http.Request) (err error) {
-	sentEnd := false
-	var sawEOF bool
+	var sawEOF, sentEnd bool
 	buf := make([]byte, cs.frameScratchBufferLen(int(cs.cc.maxFrameSize)))
 	for !sawEOF {
 		n, err := req.Body.Read(buf)
@@ -1624,7 +1596,7 @@ func (cs *http2clientStream) writeRequestBody(req *http.Request) (err error) {
 			}
 		}
 		if n > 0 {
-			sentEnd = sawEOF && req.Trailer == nil
+			sentEnd = sawEOF
 			err = cs.cc.fr.WriteData(cs.ID, sentEnd, buf[:n])
 			if err == nil {
 				err = cs.cc.bw.Flush()
@@ -1637,25 +1609,14 @@ func (cs *http2clientStream) writeRequestBody(req *http.Request) (err error) {
 	if sentEnd {
 		return nil
 	}
-	var trls []byte
-	if len(req.Trailer) > 0 {
-		trls, err = cs.cc.encodeTrailers(req.Trailer)
-		if err != nil {
-			return err
-		}
-	}
-	if len(trls) > 0 {
-		err = cs.cc.writeHeaders(cs.ID, true, int(cs.cc.maxFrameSize), trls)
-	} else {
-		err = cs.cc.fr.WriteData(cs.ID, true, nil)
-	}
+	err = cs.cc.fr.WriteData(cs.ID, true, nil)
 	if err != nil {
 		return err
 	}
 	return cs.cc.bw.Flush()
 }
 
-func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, contentLength int64, orderHeaders []string) ([]byte, error) {
+func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []string) ([]byte, error) {
 	cc.hbuf.Reset()
 	host := req.Host
 	if host == "" {
@@ -1688,9 +1649,6 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, con
 		if req.Method != "CONNECT" {
 			f(":path", path)
 			f(":scheme", req.URL.Scheme)
-		}
-		if trailers != "" {
-			f("trailer", trailers)
 		}
 		for k, vv := range req.Header {
 			if http2asciiEqualFold(k, "host") ||
@@ -1727,7 +1685,8 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, trailers string, con
 				f(k, v)
 			}
 		}
-		if http2shouldSendReqContentLength(req.Method, contentLength) {
+
+		if contentLength := http2actualContentLength(req); http2shouldSendReqContentLength(req.Method, contentLength) {
 			f("content-length", strconv.FormatInt(contentLength, 10))
 		}
 		for _, kk := range orderHeaders {
@@ -1778,27 +1737,6 @@ func http2shouldSendReqContentLength(method string, contentLength int64) bool {
 	default:
 		return false
 	}
-}
-
-func (cc *Http2ClientConn) encodeTrailers(trailer http.Header) ([]byte, error) {
-	cc.hbuf.Reset()
-	hlSize := uint64(0)
-	for k, vv := range trailer {
-		for _, v := range vv {
-			hf := hpack.HeaderField{Name: k, Value: v}
-			hlSize += uint64(hf.Size())
-		}
-	}
-	for k, vv := range trailer {
-		lowKey, ascii := http2lowerHeader(k)
-		if !ascii {
-			continue
-		}
-		for _, v := range vv {
-			cc.writeHeader(lowKey, v)
-		}
-	}
-	return cc.hbuf.Bytes(), nil
 }
 
 func (cc *Http2ClientConn) writeHeader(name, value string) {
