@@ -95,27 +95,40 @@ func (e http2ConnectionError) Error() string {
 	return fmt.Sprintf("connection error: %d", errHttp2Code(e))
 }
 
-// inflowMinRefresh is the minimum number of bytes we'll send for a
-// flow control window update.
-const http2inflowMinRefresh = 4 << 10
-
 // inflow accounts for an inbound flow control window.
 // It tracks both the latest window sent to the peer (used for enforcement)
 // and the accumulated unsent window.
 type http2inflow struct {
-	avail  int32
-	unsent int32
+	initconn   int32
+	initstream int32
+	conn       int32
+	stream     int32
+	streamRecv int32
 }
 
-func (f *http2inflow) add(n int) (connAdd int32) {
-	unsent := int64(f.unsent) + int64(n)
-	f.unsent = int32(unsent)
-	if f.unsent < http2inflowMinRefresh && f.unsent < f.avail {
-		return 0
+func (f *http2inflow) initConn(n int32) {
+	f.initconn = n
+	f.conn = n
+}
+func (f *http2inflow) initStream(n int32) {
+	f.initstream = n
+	f.stream = n
+	f.streamRecv = 0
+}
+
+func (f *http2inflow) add(dataLength, recvLength int32) (connAdd, streamAdd int32) {
+	f.conn -= dataLength
+	f.stream -= recvLength
+	f.streamRecv += recvLength
+
+	unset := dataLength - f.streamRecv
+	if f.conn < unset {
+		connAdd = f.initconn - f.conn
 	}
-	f.avail += f.unsent
-	f.unsent = 0
-	return int32(unsent)
+	if f.stream < unset {
+		streamAdd = f.initstream - f.stream
+	}
+	return
 }
 
 const http2frameHeaderLen = 9
@@ -1747,7 +1760,7 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.H2Spec, closefun 
 		if err = cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
 			return
 		}
-		cc.inflow.avail = int32(cc.spec.connFlow) + int32(cc.initialWindowSize)
+		cc.inflow.initConn(int32(cc.spec.connFlow) + int32(cc.initialWindowSize))
 		if err = cc.bw.Flush(); err != nil {
 			return
 		}
@@ -2171,7 +2184,7 @@ func (cc *Http2ClientConn) writeHeader(name, value string) {
 
 // requires cc.mu be held.
 func (cc *Http2ClientConn) addStreamLocked(cs *http2clientStream) {
-	cs.cc.inflow.avail = int32(cc.spec.streamFlow)
+	cs.cc.inflow.initStream(int32(cc.spec.streamFlow))
 	cs.ID = cc.nextStreamID
 	cc.nextStreamID += 2
 }
@@ -2251,22 +2264,21 @@ func (b http2transportResponseBody) Close() error {
 	return b.cs.bodyReader.Close()
 }
 func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2DataFrame) error {
-	cc := rl.cc
 	data := f.Data()
 	if f.Length > 0 {
-		var refund int
-		if pad := int(f.Length) - len(data); pad > 0 {
-			refund += pad
-		}
 		if len(data) > 0 {
 			if _, err := cs.bodyWriter.Write(data); err != nil {
 				return err
 			}
 		}
-		sendConn := cc.inflow.add(refund)
-		if sendConn > 0 {
-			cc.fr.WriteWindowUpdate(cs.ID, uint32(sendConn))
-			cc.bw.Flush()
+		connAdd, streamAdd := rl.cc.inflow.add(int32(f.Length), int32(len(data)))
+		if connAdd > 0 {
+			rl.cc.fr.WriteWindowUpdate(0, uint32(connAdd))
+			rl.cc.bw.Flush()
+		}
+		if streamAdd > 0 {
+			rl.cc.fr.WriteWindowUpdate(cs.ID, uint32(streamAdd))
+			rl.cc.bw.Flush()
 		}
 	}
 	if f.StreamEnded() {
