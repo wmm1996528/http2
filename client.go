@@ -117,7 +117,7 @@ func (f *http2inflow) initStream(n int32) {
 }
 
 func (f *http2inflow) add(dataLength, recvLength int32) (connAdd, streamAdd int32) {
-	f.conn -= dataLength
+	f.conn -= recvLength
 	f.stream -= recvLength
 	f.streamRecv += recvLength
 
