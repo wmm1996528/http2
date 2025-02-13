@@ -139,7 +139,7 @@ func clearOrderHeaders(headers []string) []string {
 	}
 	return orderHeaders
 }
-func spec2option(h2Spec ja3.H2Spec) gospiderOption {
+func spec2option(h2Spec ja3.HSpec) gospiderOption {
 	var headerTableSize uint32 = 65536
 	var maxHeaderListSize uint32 = 262144
 	var initialWindowSize uint32 = 6291456
@@ -185,7 +185,7 @@ func spec2option(h2Spec ja3.H2Spec) gospiderOption {
 		maxHeaderListSize: maxHeaderListSize,
 	}
 }
-func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.H2Spec, closefun func()) (*Http2ClientConn, error) {
+func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun func()) (*Http2ClientConn, error) {
 	spec := spec2option(h2Spec)
 	cc := &Http2ClientConn{
 		closeFunc:         closefun,
