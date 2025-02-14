@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -52,11 +53,13 @@ type http2clientStream struct {
 	bodyWriter           *io.PipeWriter
 	reqBodyContentLength int64
 	ID                   uint32
+	inflow               http2inflow
 }
 
 func (cc *Http2ClientConn) run() (err error) {
 	defer func() {
 		cc.err = err
+		log.Print(err, "  ====")
 		cc.CloseWithError(err)
 	}()
 	for {
@@ -222,7 +225,7 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun f
 		if err = cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
 			return
 		}
-		cc.inflow.initConn(int32(cc.spec.connFlow))
+		cc.inflow.init(int32(cc.spec.connFlow) + int32(cc.spec.initialWindowSize))
 		if err = cc.bw.Flush(); err != nil {
 			return
 		}
@@ -304,7 +307,7 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 }
 
 func (cs *http2clientStream) writeRequest(req *http.Request, orderHeaders []string) (err error) {
-	cs.cc.inflow.initRecv()
+	cs.inflow.init(int32(cs.cc.spec.initialWindowSize))
 	cs.ID = cs.cc.nextStreamID
 	cs.cc.nextStreamID += 2
 	err = cs.encodeAndWriteHeaders(req, orderHeaders)
@@ -550,7 +553,23 @@ type http2transportResponseBody struct {
 }
 
 func (b http2transportResponseBody) Read(p []byte) (n int, err error) {
-	return b.cs.bodyReader.Read(p)
+	n, err = b.cs.bodyReader.Read(p)
+	// if n > 0 {
+	// 	connAdd := b.cs.cc.inflow.add(n)
+	// 	streamAdd := b.cs.inflow.add(n)
+	// 	if connAdd > 0 || streamAdd > 0 {
+	// 		if connAdd > 0 {
+	// 			b.cs.cc.fr.WriteWindowUpdate(0, uint32(connAdd))
+	// 		}
+	// 		if streamAdd > 0 {
+	// 			b.cs.cc.fr.WriteWindowUpdate(b.cs.ID, uint32(streamAdd))
+	// 		}
+	// 		if err2 := b.cs.cc.bw.Flush(); err2 != nil {
+	// 			return n, err2
+	// 		}
+	// 	}
+	// }
+	return
 }
 func (b http2transportResponseBody) Close() error {
 	return b.cs.bodyReader.Close()
@@ -562,18 +581,25 @@ func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2Da
 				return err
 			}
 		}
-		if connAdd := rl.cc.inflow.add(int32(f.Length), int32(len(f.Data()))); connAdd > 0 {
-			if err := rl.cc.fr.WriteWindowUpdate(0, uint32(connAdd)); err != nil {
-				return err
+		connAdd := rl.cc.inflow.add(int32(f.Length))
+		streamAdd := cs.inflow.add(int32(f.Length))
+		if connAdd > 0 || streamAdd > 0 {
+			if connAdd > 0 {
+				if err := rl.cc.fr.WriteWindowUpdate(0, uint32(connAdd)); err != nil {
+					return err
+				}
 			}
-			if err := rl.cc.fr.WriteWindowUpdate(cs.ID, uint32(connAdd)); err != nil {
-				return err
+			if streamAdd > 0 {
+				if err := rl.cc.fr.WriteWindowUpdate(cs.ID, uint32(connAdd)); err != nil {
+					return err
+				}
 			}
 			if err := rl.cc.bw.Flush(); err != nil {
 				return err
 			}
 		}
 	}
+
 	if f.StreamEnded() {
 		return cs.bodyWriter.CloseWithError(io.EOF)
 	}

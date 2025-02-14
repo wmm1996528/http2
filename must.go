@@ -35,29 +35,22 @@ func (e http2ConnectionError) Error() string {
 }
 
 type http2inflow struct {
-	initconn int32
-	conn     int32
-	connRecv int32
+	avail  int32
+	unsent int32
 }
 
-func (f *http2inflow) initConn(n int32) {
-	f.initconn = n
-
-	f.conn = n
-	f.connRecv = 0
+func (f *http2inflow) init(n int32) {
+	f.avail = n
 }
-func (f *http2inflow) initRecv() {
-	f.connRecv = 0
-}
-
-func (f *http2inflow) add(dataLength, recvLength int32) (connAdd int32) {
-	f.conn -= recvLength
-	f.connRecv += recvLength
-	unset := dataLength - f.connRecv
-	if f.conn < unset {
-		connAdd = f.initconn - f.conn
+func (f *http2inflow) add(n int32) (connAdd int32) {
+	unsent := int64(f.unsent) + int64(n)
+	f.unsent = int32(unsent)
+	if f.unsent < 4<<10 && f.unsent < f.avail {
+		return 0
 	}
-	return
+	f.avail += f.unsent
+	f.unsent = 0
+	return int32(unsent)
 }
 
 const http2frameHeaderLen = 9
