@@ -35,34 +35,27 @@ func (e http2ConnectionError) Error() string {
 }
 
 type http2inflow struct {
-	initconn   int32
-	initstream int32
-	conn       int32
-	stream     int32
-	streamRecv int32
+	initconn int32
+	conn     int32
+	connRecv int32
 }
 
 func (f *http2inflow) initConn(n int32) {
 	f.initconn = n
+
 	f.conn = n
+	f.connRecv = 0
 }
-func (f *http2inflow) initStream(n int32) {
-	f.initstream = n
-	f.stream = n
-	f.streamRecv = 0
+func (f *http2inflow) initRecv() {
+	f.connRecv = 0
 }
 
-func (f *http2inflow) add(dataLength, recvLength int32) (connAdd, streamAdd int32) {
+func (f *http2inflow) add(dataLength, recvLength int32) (connAdd int32) {
 	f.conn -= recvLength
-	f.stream -= recvLength
-	f.streamRecv += recvLength
-
-	unset := dataLength - f.streamRecv
+	f.connRecv += recvLength
+	unset := dataLength - f.connRecv
 	if f.conn < unset {
 		connAdd = f.initconn - f.conn
-	}
-	if f.stream < unset {
-		streamAdd = f.initstream - f.stream
 	}
 	return
 }
@@ -273,10 +266,43 @@ func (fr *http2Framer) ReadFrame() (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if fh.Type == http2FrameHeaders && fr.ReadMetaHeaders != nil {
+	if fh.Type == http2FrameHeaders {
 		return fr.readMetaFrame(f.(*http2HeadersFrame))
 	}
 	return f, nil
+}
+func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (any, error) {
+	mh := &http2MetaHeadersFrame{
+		http2HeadersFrame: hf,
+	}
+	fr.ReadMetaHeaders.SetEmitEnabled(true)
+	fr.ReadMetaHeaders.SetEmitFunc(func(hf hpack.HeaderField) {
+		mh.Fields = append(mh.Fields, hf)
+	})
+	defer func() {
+		fr.ReadMetaHeaders.SetEmitEnabled(false)
+		fr.ReadMetaHeaders.SetEmitFunc(nil)
+	}()
+	var hc http2headersOrContinuation = hf
+	for {
+		frag := hc.HeaderBlockFragment()
+		if _, err := fr.ReadMetaHeaders.Write(frag); err != nil {
+			return mh, http2ConnectionError(errHttp2CodeCompression)
+		}
+		if hc.HeadersEnded() {
+			break
+		}
+		if f, err := fr.ReadFrame(); err != nil {
+			return nil, err
+		} else {
+			hc = f.(*http2ContinuationFrame)
+		}
+	}
+	mh.http2HeadersFrame.headerFragBuf = nil
+	if err := fr.ReadMetaHeaders.Close(); err != nil {
+		return mh, http2ConnectionError(errHttp2CodeCompression)
+	}
+	return mh, nil
 }
 
 type http2DataFrame struct {
@@ -706,17 +732,14 @@ func http2parsePushPromise(_ *http2frameCache, fh http2FrameHeader, p []byte) (_
 		http2FrameHeader: fh,
 	}
 	if pp.StreamID == 0 {
-
 		return nil, http2ConnectionError(errHttp2CodeProtocol)
 	}
-
 	var padLength uint8
 	if fh.Flags.Has(http2FlagPushPromisePadded) {
 		if p, padLength, err = http2readByte(p); err != nil {
 			return
 		}
 	}
-
 	p, pp.PromiseID, err = http2readUint32(p)
 	if err != nil {
 		return
@@ -824,39 +847,6 @@ func (mh *http2MetaHeadersFrame) PseudoFields() []hpack.HeaderField {
 		}
 	}
 	return mh.Fields
-}
-
-func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (any, error) {
-	mh := &http2MetaHeadersFrame{
-		http2HeadersFrame: hf,
-	}
-	fr.ReadMetaHeaders.SetEmitEnabled(true)
-	fr.ReadMetaHeaders.SetEmitFunc(func(hf hpack.HeaderField) {
-		mh.Fields = append(mh.Fields, hf)
-	})
-	defer fr.ReadMetaHeaders.SetEmitFunc(func(hf hpack.HeaderField) {})
-
-	var hc http2headersOrContinuation = hf
-	for {
-		frag := hc.HeaderBlockFragment()
-		if _, err := fr.ReadMetaHeaders.Write(frag); err != nil {
-			return mh, http2ConnectionError(errHttp2CodeCompression)
-		}
-		if hc.HeadersEnded() {
-			break
-		}
-		if f, err := fr.ReadFrame(); err != nil {
-			return nil, err
-		} else {
-			hc = f.(*http2ContinuationFrame)
-		}
-	}
-
-	mh.http2HeadersFrame.headerFragBuf = nil
-	if err := fr.ReadMetaHeaders.Close(); err != nil {
-		return mh, http2ConnectionError(errHttp2CodeCompression)
-	}
-	return mh, nil
 }
 
 type http2Setting struct {

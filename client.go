@@ -59,7 +59,6 @@ func (cc *Http2ClientConn) run() (err error) {
 		cc.err = err
 		cc.CloseWithError(err)
 	}()
-
 	for {
 		f, err := cc.fr.ReadFrame()
 		if err != nil {
@@ -79,27 +78,33 @@ func (cc *Http2ClientConn) run() (err error) {
 				return tools.WrapError(err, "processData")
 			}
 		case *http2GoAwayFrame:
-			if err = cc.loop.processGoAway(f); err != nil {
-				return tools.WrapError(err, "processGoAway")
+			if f.ErrCode == 0 {
+				err = fmt.Errorf("http2: server sent GOAWAY with close connection ok")
+			} else {
+				err = fmt.Errorf("http2: server sent GOAWAY with error code %v", f.ErrCode)
 			}
+			return tools.WrapError(err, "processGoAway")
 		case *http2RSTStreamFrame:
-			if err = cc.loop.processResetStream(f); err != nil {
-				return tools.WrapError(err, "processResetStream")
+			if f.ErrCode == 0 {
+				err = fmt.Errorf("http2: server sent processResetStream with close connection ok")
+			} else {
+				err = fmt.Errorf("http2: server sent processResetStream with error code %v", f.ErrCode)
 			}
+			return tools.WrapError(err, "processResetStream")
 		case *http2SettingsFrame:
 			if err = cc.loop.processSettings(f); err != nil {
 				return tools.WrapError(err, "processSettings")
 			}
 		case *http2PushPromiseFrame:
-			if err = cc.loop.processPushPromise(); err != nil {
-				return tools.WrapError(err, "processPushPromise")
-			}
+			err = http2ConnectionError(errHttp2CodeProtocol)
+			return tools.WrapError(err, "processPushPromise")
 		case *http2WindowUpdateFrame:
 		case *http2PingFrame:
 			if err = cc.loop.processPing(f); err != nil {
 				return tools.WrapError(err, "processPing")
 			}
 		default:
+			return tools.WrapError(fmt.Errorf("unknown frame type: %T", f), "run")
 		}
 	}
 }
@@ -299,10 +304,9 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 }
 
 func (cs *http2clientStream) writeRequest(req *http.Request, orderHeaders []string) (err error) {
-	cs.cc.inflow.initStream(int32(cs.cc.initialWindowSize))
+	cs.cc.inflow.initRecv()
 	cs.ID = cs.cc.nextStreamID
 	cs.cc.nextStreamID += 2
-
 	err = cs.encodeAndWriteHeaders(req, orderHeaders)
 	if err != nil {
 		return err
@@ -319,8 +323,7 @@ func (cs *http2clientStream) encodeAndWriteHeaders(req *http.Request, orderHeade
 	if err != nil {
 		return err
 	}
-	err = cc.writeHeaders(cs.ID, http2actualContentLength(req) == 0, int(cc.maxFrameSize), hdrs)
-	return err
+	return cc.writeHeaders(cs.ID, http2actualContentLength(req) == 0, int(cc.maxFrameSize), hdrs)
 }
 
 func (cc *Http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
@@ -333,7 +336,7 @@ func (cc *Http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFram
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
 		if first {
-			cc.fr.WriteHeaders(http2HeadersFrameParam{
+			if err := cc.fr.WriteHeaders(http2HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
 				EndStream:     endStream,
@@ -343,10 +346,14 @@ func (cc *Http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFram
 					Exclusive: cc.spec.priority.Exclusive,
 					Weight:    cc.spec.priority.Weight,
 				},
-			})
+			}); err != nil {
+				return err
+			}
 			first = false
 		} else {
-			cc.fr.WriteContinuation(streamID, endHeaders, chunk)
+			if err := cc.fr.WriteContinuation(streamID, endHeaders, chunk); err != nil {
+				return err
+			}
 		}
 	}
 	return cc.bw.Flush()
@@ -549,46 +556,44 @@ func (b http2transportResponseBody) Close() error {
 	return b.cs.bodyReader.Close()
 }
 func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2DataFrame) error {
-	data := f.Data()
 	if f.Length > 0 {
-		if len(data) > 0 {
-			if _, err := cs.bodyWriter.Write(data); err != nil {
+		if len(f.Data()) > 0 {
+			if _, err := cs.bodyWriter.Write(f.Data()); err != nil {
 				return err
 			}
 		}
-		connAdd, streamAdd := rl.cc.inflow.add(int32(f.Length), int32(len(data)))
-		if connAdd > 0 {
-			rl.cc.fr.WriteWindowUpdate(0, uint32(connAdd))
-			rl.cc.bw.Flush()
-		}
-		if streamAdd > 0 {
-			rl.cc.fr.WriteWindowUpdate(cs.ID, uint32(streamAdd))
-			rl.cc.bw.Flush()
+		if connAdd := rl.cc.inflow.add(int32(f.Length), int32(len(f.Data()))); connAdd > 0 {
+			if err := rl.cc.fr.WriteWindowUpdate(0, uint32(connAdd)); err != nil {
+				return err
+			}
+			if err := rl.cc.fr.WriteWindowUpdate(cs.ID, uint32(connAdd)); err != nil {
+				return err
+			}
+			if err := rl.cc.bw.Flush(); err != nil {
+				return err
+			}
 		}
 	}
 	if f.StreamEnded() {
-		cs.bodyWriter.CloseWithError(io.EOF)
+		return cs.bodyWriter.CloseWithError(io.EOF)
 	}
 	return nil
 }
-func (rl *http2clientConnReadLoop) processGoAway(f *http2GoAwayFrame) error {
-	if f.ErrCode == 0 {
-		return nil
-	}
-	return fmt.Errorf("http2: server sent GOAWAY with error code %v", f.ErrCode)
-}
+
 func (rl *http2clientConnReadLoop) processSettings(f *http2SettingsFrame) error {
 	if err := rl.processSettingsNoWrite(f); err != nil {
 		return err
 	}
 	if !f.IsAck() {
-		rl.cc.fr.WriteSettingsAck()
-		rl.cc.bw.Flush()
+		if err := rl.cc.fr.WriteSettingsAck(); err != nil {
+			return err
+		}
+		return rl.cc.bw.Flush()
 	}
 	return nil
 }
 func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame) error {
-	err := f.ForeachSetting(func(s http2Setting) error {
+	return f.ForeachSetting(func(s http2Setting) error {
 		switch s.ID {
 		case Http2SettingMaxFrameSize:
 			rl.cc.maxFrameSize = s.Val
@@ -601,17 +606,6 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame)
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (rl *http2clientConnReadLoop) processResetStream(f *http2RSTStreamFrame) error {
-	if f.ErrCode == 0 {
-		return nil
-	}
-	return fmt.Errorf("stream error: %v", f.ErrCode)
 }
 func (cc *Http2ClientConn) Ping(ctx context.Context) error {
 	var p [8]byte
@@ -619,18 +613,11 @@ func (cc *Http2ClientConn) Ping(ctx context.Context) error {
 	if pingError := cc.fr.WritePing(false, p); pingError != nil {
 		return pingError
 	}
-	if pingError := cc.bw.Flush(); pingError != nil {
-		return pingError
-	}
-	return nil
-}
-func (rl *http2clientConnReadLoop) processPing(f *http2PingFrame) error {
-	cc := rl.cc
-	if err := cc.fr.WritePing(true, f.Data); err != nil {
-		return err
-	}
 	return cc.bw.Flush()
 }
-func (rl *http2clientConnReadLoop) processPushPromise() error {
-	return http2ConnectionError(errHttp2CodeProtocol)
+func (rl *http2clientConnReadLoop) processPing(f *http2PingFrame) error {
+	if err := rl.cc.fr.WritePing(true, f.Data); err != nil {
+		return err
+	}
+	return rl.cc.bw.Flush()
 }
