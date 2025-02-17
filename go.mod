@@ -1,6 +1,6 @@
 module github.com/gospider007/http2
 
-go 1.23.0
+go 1.24.0
 
 require (
 	github.com/gospider007/ja3 v0.0.0-20250213065305-00640defaae1
