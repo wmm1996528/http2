@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -15,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gospider007/ja3"
 	"github.com/gospider007/tools"
@@ -53,12 +53,11 @@ type http2clientStream struct {
 	bodyReader           *io.PipeReader
 	bodyWriter           *io.PipeWriter
 	bodyCtx              context.Context
-	bodyCnl              context.CancelFunc
+	bodyCnl              context.CancelCauseFunc
 	reqBodyContentLength int64
 	ID                   uint32
 	inflow               http2inflow
 	flow                 http2outflow
-	bodyErr              error
 }
 
 func (cc *Http2ClientConn) notice() {
@@ -70,7 +69,6 @@ func (cc *Http2ClientConn) notice() {
 func (cc *Http2ClientConn) run() (err error) {
 	defer func() {
 		cc.err = err
-		log.Print(err, "  ====")
 		cc.CloseWithError(err)
 	}()
 	for {
@@ -102,7 +100,8 @@ func (cc *Http2ClientConn) run() (err error) {
 			switch f.ErrCode {
 			case 0, 5:
 				if cc.http2clientStream != nil && cc.http2clientStream.ID == f.StreamID {
-					cc.http2clientStream.bodyCnl()
+					cc.http2clientStream.headCnl()
+					cc.http2clientStream.bodyCnl(errStreamClosedOk)
 				}
 			default:
 				err = fmt.Errorf("http2: server sent processResetStream with error code %v", f.ErrCode)
@@ -301,7 +300,7 @@ func (cc *Http2ClientConn) initStream(req *http.Request) {
 		cc.streamID = 1
 	} else {
 		cc.streamID += 2
-		cc.http2clientStream.bodyCnl()
+		cc.http2clientStream.bodyCnl(errors.New("next streamID clear"))
 	}
 	ctx := req.Context()
 	reader, writer := io.Pipe()
@@ -311,7 +310,7 @@ func (cc *Http2ClientConn) initStream(req *http.Request) {
 		bodyReader:           reader,
 		bodyWriter:           writer,
 	}
-	cs.bodyCtx, cs.bodyCnl = context.WithCancel(ctx)
+	cs.bodyCtx, cs.bodyCnl = context.WithCancelCause(ctx)
 	cs.headCtx, cs.headCnl = context.WithCancel(ctx)
 	cc.http2clientStream = cs
 	cs.inflow.init(int32(cs.cc.spec.initialWindowSize))
@@ -340,21 +339,10 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 		}
 		return cc.http2clientStream.resp, cc.err
 	case <-cc.http2clientStream.bodyCtx.Done():
-		if cc.http2clientStream.bodyErr != nil {
-			return nil, cc.http2clientStream.bodyErr
+		if cc.http2clientStream.resp != nil {
+			cc.http2clientStream.resp.Request = req
 		}
-		select {
-		case <-cc.http2clientStream.headCtx.Done():
-			if cc.http2clientStream.resp != nil {
-				cc.http2clientStream.resp.Request = req
-			}
-			return cc.http2clientStream.resp, cc.err
-		case <-req.Context().Done():
-			if cc.err != nil {
-				return nil, cc.err
-			}
-			return nil, req.Context().Err()
-		}
+		return cc.http2clientStream.resp, context.Cause(cc.http2clientStream.bodyCtx)
 	case <-req.Context().Done():
 		if cc.err != nil {
 			return nil, cc.err
@@ -434,7 +422,7 @@ func (cs *http2clientStream) frameScratchBufferLen(maxFrameSize int) int {
 	return int(n)
 }
 
-var ErrReqBodyClosed = errors.New("request body closed")
+var errStreamClosedOk = errors.New("stream close ok")
 
 func (cs *http2clientStream) available(maxBytes int) (taken int32) {
 	cs.cc.wmu.Lock()
@@ -459,25 +447,33 @@ func (cs *http2clientStream) awaitFlowControl(maxBytes int) (taken int32, err er
 		}
 		select {
 		case <-cs.bodyCtx.Done():
-			return 0, ErrReqBodyClosed
+			return 0, context.Cause(cs.bodyCtx)
 		case <-cs.cc.flowNotices:
-		}
-		if cs.ID != cs.cc.streamID {
-			return 0, ErrReqBodyClosed
+		case <-time.After(time.Second * 30):
+			return 0, errors.New("timeout waiting for flow control")
 		}
 	}
 }
 
 func (cs *http2clientStream) writeRequestBody(req *http.Request) {
+	var bodyErr error
+	defer func() {
+		if bodyErr != nil {
+			if !errors.Is(bodyErr, errStreamClosedOk) {
+				cs.cc.CloseWithError(bodyErr)
+			}
+			cs.bodyCnl(bodyErr)
+		}
+	}()
 	buf := make([]byte, cs.frameScratchBufferLen(int(cs.cc.spec.maxFrameSize)))
 	for {
 		n, err := req.Body.Read(buf)
 		if n > 0 {
-			if cs.bodyErr = cs.WriteData(err != nil, buf[:n]); cs.bodyErr != nil {
+			if bodyErr = cs.WriteData(err != nil, buf[:n]); bodyErr != nil {
 				return
 			}
 		} else if err != nil {
-			if cs.bodyErr = cs.WriteEndNoData(); cs.bodyErr != nil {
+			if bodyErr = cs.WriteEndNoData(); bodyErr != nil {
 				return
 			}
 		}
@@ -485,7 +481,7 @@ func (cs *http2clientStream) writeRequestBody(req *http.Request) {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return
 			}
-			cs.bodyErr = err
+			bodyErr = err
 			return
 		}
 	}
@@ -509,11 +505,6 @@ func (cs *http2clientStream) WriteData(endStream bool, remain []byte) (err error
 		var allowed int32
 		allowed, err = cs.awaitFlowControl(len(remain))
 		if err != nil {
-			if err == ErrReqBodyClosed {
-				if err2 := cs.WriteEndNoData(); err2 != nil {
-					return err2
-				}
-			}
 			return err
 		}
 		data := remain[:allowed]
