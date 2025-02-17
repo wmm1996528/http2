@@ -34,6 +34,50 @@ func (e http2ConnectionError) Error() string {
 	return fmt.Sprintf("connection error: %d", errHttp2Code(e))
 }
 
+// outflow is the outbound flow control window's size.
+type http2outflow struct {
+
+	// n is the number of DATA bytes we're allowed to send.
+	// An outflow is kept both on a conn and a per-stream.
+	n int32
+
+	// conn points to the shared connection-level outflow that is
+	// shared by all streams on that conn. It is nil for the outflow
+	// that's on the conn directly.
+	conn *http2outflow
+}
+
+func (f *http2outflow) setConnFlow(cf *http2outflow) { f.conn = cf }
+
+func (f *http2outflow) available() int32 {
+	n := f.n
+	if f.conn != nil && f.conn.n < n {
+		n = f.conn.n
+	}
+	return n
+}
+
+func (f *http2outflow) take(n int32) {
+	// if n > f.available() {
+	// 	panic("internal error: took too much")
+	// }
+	f.n -= n
+	if f.conn != nil {
+		f.conn.n -= n
+	}
+}
+
+// add adds n bytes (positive or negative) to the flow control window.
+// It returns false if the sum would exceed 2^31-1.
+func (f *http2outflow) add(n int32) bool {
+	sum := f.n + n
+	if (sum > n) == (f.n > 0) {
+		f.n = sum
+		return true
+	}
+	return false
+}
+
 type http2inflow struct {
 	avail  int32
 	unsent int32
@@ -202,7 +246,6 @@ func (f *http2Framer) endWrite() error {
 		byte(length>>16),
 		byte(length>>8),
 		byte(length))
-
 	n, err := f.w.Write(f.wbuf)
 	if err == nil && n != len(f.wbuf) {
 		err = io.ErrShortWrite
