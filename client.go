@@ -43,6 +43,12 @@ type Http2ClientConn struct {
 	streamID uint32
 
 	flowNotices chan struct{}
+	closeCtx    context.Context
+	closeCnl    context.CancelCauseFunc
+}
+
+func (cc *Http2ClientConn) CloseCtx() context.Context {
+	return cc.closeCtx
 }
 
 type http2clientStream struct {
@@ -68,6 +74,7 @@ func (cc *Http2ClientConn) notice() {
 }
 func (cc *Http2ClientConn) run() (err error) {
 	defer func() {
+		cc.closeCnl(err)
 		cc.err = err
 		cc.CloseWithError(err)
 	}()
@@ -228,6 +235,7 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun f
 		tconn:       c,
 		flowNotices: make(chan struct{}, 1),
 	}
+	cc.closeCtx, cc.closeCnl = context.WithCancelCause(context.TODO())
 	cc.bw = bufio.NewWriter(c)
 	cc.fr = http2NewFramer(cc.bw, bufio.NewReader(c))
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(cc.spec.headerTableSize, nil)
@@ -544,7 +552,7 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []strin
 			gospiderHeaders[name] = append(gospiderHeaders[name], value)
 		}
 		f(":authority", host)
-		f(":method", http.MethodGet)
+		f(":method", req.Method)
 		if req.Method != http.MethodConnect {
 			f(":path", path)
 			f(":scheme", req.URL.Scheme)
@@ -619,6 +627,12 @@ type http2clientConnReadLoop struct {
 	cc *Http2ClientConn
 }
 
+type http2noBodyReader struct{}
+
+func (http2noBodyReader) Close() error { return nil }
+
+func (http2noBodyReader) Read([]byte) (int, error) { return 0, io.EOF }
+
 func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *http2MetaHeadersFrame) (*http.Response, error) {
 	status := f.PseudoValue("status")
 	statusCode, err := strconv.Atoi(status)
@@ -657,6 +671,7 @@ func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *http
 		res.ContentLength = 0
 	}
 	if f.StreamEnded() {
+		res.Body = http2noBodyReader{}
 		return res, nil
 	}
 	res.Body = http2transportResponseBody{cs}
