@@ -10,8 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,7 +23,7 @@ import (
 
 type Http2ClientConn struct {
 	tconn             net.Conn
-	closeFunc         func()
+	closeFunc         func(error)
 	loop              *http2clientConnReadLoop
 	http2clientStream *http2clientStream
 
@@ -46,6 +44,7 @@ type Http2ClientConn struct {
 	flowNotices chan struct{}
 	closeCtx    context.Context
 	closeCnl    context.CancelCauseFunc
+	shutdownErr error
 }
 
 func (cc *Http2ClientConn) CloseCtx() context.Context {
@@ -82,15 +81,18 @@ func (cc *Http2ClientConn) notice() {
 	default:
 	}
 }
+
 func (cc *Http2ClientConn) run() (err error) {
-	defer cc.CloseWithError(err)
+	defer func() {
+		cc.CloseWithError(err)
+	}()
 	for {
 		f, err := cc.fr.ReadFrame()
 		if err != nil {
 			return tools.WrapError(err, "ReadFrame")
 		}
 		switch f := f.(type) {
-		case *http2MetaHeadersFrame:
+		case *Http2MetaHeadersFrame:
 			if cc.http2clientStream == nil {
 				return tools.WrapError(errors.New("unexpected meta headers frame"), "run")
 			}
@@ -99,42 +101,53 @@ func (cc *Http2ClientConn) run() (err error) {
 			if err != nil {
 				return tools.WrapError(err, "handleResponse")
 			}
-		case *http2DataFrame:
+		case *Http2DataFrame:
 			if err = cc.loop.processData(cc.http2clientStream, f); err != nil {
 				return tools.WrapError(err, "processData")
 			}
-		case *http2GoAwayFrame:
+		case *Http2GoAwayFrame:
 			if f.ErrCode == 0 {
-				err = fmt.Errorf("http2: server sent GOAWAY with close connection ok")
+				cc.shutdownErr = fmt.Errorf("http2: server sent GOAWAY with close connection ok")
 			} else {
 				err = fmt.Errorf("http2: server sent GOAWAY with error code %v", f.ErrCode)
+				return tools.WrapError(err, "GOAWAY")
 			}
-			return tools.WrapError(err, "processGoAway")
-		case *http2RSTStreamFrame:
+		case *Http2RSTStreamFrame:
 			if f.ErrCode == 0 {
-				err = fmt.Errorf("http2: server sent processResetStream with close connection ok")
+				cc.shutdownErr = fmt.Errorf("http2: server sent processResetStream with close connection ok")
 			} else {
 				err = fmt.Errorf("http2: server sent processResetStream with error code %v", f.ErrCode)
+				return tools.WrapError(err, "processResetStream")
 			}
-			return tools.WrapError(err, "processResetStream")
-		case *http2SettingsFrame:
+		case *Http2SettingsFrame:
 			if err = cc.loop.processSettings(f); err != nil {
 				return tools.WrapError(err, "processSettings")
 			}
-		case *http2PushPromiseFrame:
+		case *Http2PushPromiseFrame:
 			err = http2ConnectionError(errHttp2CodeProtocol)
 			return tools.WrapError(err, "processPushPromise")
-		case *http2WindowUpdateFrame:
+		case *Http2WindowUpdateFrame:
 			if err = cc.loop.processWindowUpdate(f); err != nil {
 				return tools.WrapError(err, "processWindowUpdate")
 			}
-		case *http2PingFrame:
+		case *Http2PingFrame:
 			if err = cc.loop.processPing(f); err != nil {
 				return tools.WrapError(err, "processPing")
 			}
 		default:
 			err = fmt.Errorf("unknown frame type: %T", f)
 			return tools.WrapError(err, "run")
+		}
+		if cc.shutdownErr != nil {
+			if cc.http2clientStream != nil {
+				select {
+				case <-cc.http2clientStream.readCtx.Done():
+					return cc.shutdownErr
+				default:
+				}
+			} else {
+				return cc.shutdownErr
+			}
 		}
 	}
 }
@@ -201,7 +214,7 @@ func spec2option(h2Spec ja3.HSpec) (option gospiderOption) {
 	return option
 }
 
-func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun func()) (*Http2ClientConn, error) {
+func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun func(error)) (*Http2ClientConn, error) {
 	spec := spec2option(h2Spec)
 	cc := &Http2ClientConn{
 		closeFunc:   closefun,
@@ -215,9 +228,9 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun f
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(cc.spec.headerTableSize, nil)
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(cc.spec.headerTableSize)
-	initialSettings := make([]http2Setting, len(cc.spec.initialSetting))
+	initialSettings := make([]Http2Setting, len(cc.spec.initialSetting))
 	for i, setting := range cc.spec.initialSetting {
-		initialSettings[i] = http2Setting{ID: http2SettingID(setting.Id), Val: setting.Val}
+		initialSettings[i] = Http2Setting{ID: Http2SettingID(setting.Id), Val: setting.Val}
 	}
 	cc.spec.initialWindowSize = 65535
 	cc.flow.add(int32(cc.spec.initialWindowSize))
@@ -254,8 +267,8 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun f
 
 func (cc *Http2ClientConn) CloseWithError(err error) error {
 	cc.closeCnl(err)
-	if err != io.EOF && cc.closeFunc != nil {
-		cc.closeFunc()
+	if cc.closeFunc != nil {
+		cc.closeFunc(err)
 	}
 	cc.tconn.Close()
 	if cc.http2clientStream != nil {
@@ -301,12 +314,18 @@ func (cc *Http2ClientConn) initStream(req *http.Request) {
 	cs.ID = cs.cc.streamID
 }
 
-func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (response *http.Response, bodyCtx context.Context, err error) {
+func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []interface {
+	Key() string
+	Val() any
+}) (response *http.Response, bodyCtx context.Context, err error) {
 	defer func() {
 		if err != nil {
 			cc.CloseWithError(err)
 		}
 	}()
+	if cc.shutdownErr != nil {
+		return nil, nil, cc.shutdownErr
+	}
 	cc.initStream(req)
 	go cc.http2clientStream.writeRequest(req, orderHeaders)
 	select {
@@ -319,7 +338,10 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []string) (
 	}
 }
 
-func (cs *http2clientStream) writeRequest(req *http.Request, orderHeaders []string) (err error) {
+func (cs *http2clientStream) writeRequest(req *http.Request, orderHeaders []interface {
+	Key() string
+	Val() any
+}) (err error) {
 	defer func() {
 		if err != nil {
 			cs.cc.CloseWithError(err)
@@ -335,7 +357,10 @@ func (cs *http2clientStream) writeRequest(req *http.Request, orderHeaders []stri
 	return
 }
 
-func (cs *http2clientStream) encodeAndWriteHeaders(req *http.Request, orderHeaders []string) error {
+func (cs *http2clientStream) encodeAndWriteHeaders(req *http.Request, orderHeaders []interface {
+	Key() string
+	Val() any
+}) error {
 	cs.cc.wmu.Lock()
 	defer cs.cc.wmu.Unlock()
 	hdrs, err := cs.cc.encodeHeaders(req, orderHeaders)
@@ -354,7 +379,7 @@ func (cc *Http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFram
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
 		if first {
-			http2HeadersFrameParam := http2HeadersFrameParam{
+			http2HeadersFrameParam := Http2HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
 				EndStream:     endStream,
@@ -484,7 +509,10 @@ func (cs *http2clientStream) WriteData(endStream bool, remain []byte) (err error
 	return
 }
 
-func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []string) ([]byte, error) {
+func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []interface {
+	Key() string
+	Val() any
+}) ([]byte, error) {
 	cc.hbuf.Reset()
 	host := req.Host
 	if host == "" {
@@ -508,11 +536,11 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []strin
 				strings.ToLower(name), value,
 			})
 		}
-		f(":authority", host)
 		f(":method", req.Method)
+		f(":authority", host)
 		if req.Method != http.MethodConnect {
-			f(":path", path)
 			f(":scheme", req.URL.Scheme)
+			f(":path", path)
 		}
 		for k, vv := range req.Header {
 			switch strings.ToLower(k) {
@@ -529,53 +557,19 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []strin
 				}
 			}
 		}
-		if contentLength := http2actualContentLength(req); http2shouldSendReqContentLength(req.Method, contentLength) {
+
+		if contentLength, _ := tools.GetContentLength(req); contentLength >= 0 {
 			f("content-length", strconv.FormatInt(contentLength, 10))
 		}
-		sort.Slice(gospiderHeaders, func(x, y int) bool {
-			xI := slices.Index(orderHeaders, gospiderHeaders[x][0])
-			yI := slices.Index(orderHeaders, gospiderHeaders[y][0])
-			if xI < 0 {
-				return false
-			}
-			if yI < 0 {
-				return true
-			}
-			if xI <= yI {
-				return true
-			}
-			return false
-		})
-		for _, kv := range gospiderHeaders {
+		for _, kv := range tools.NewHeadersWithH2(orderHeaders, gospiderHeaders) {
 			replaceF(kv[0], kv[1])
 		}
 	}
-	hlSize := uint64(0)
-	enumerateHeaders(func(name, value string) {
-		hf := hpack.HeaderField{Name: name, Value: value}
-		hlSize += uint64(hf.Size())
-	})
 	enumerateHeaders(func(name, value string) {
 		name = strings.ToLower(name)
 		cc.writeHeader(name, value)
 	})
 	return cc.hbuf.Bytes(), nil
-}
-
-func http2shouldSendReqContentLength(method string, contentLength int64) bool {
-	if contentLength > 0 {
-		return true
-	}
-	if contentLength < 0 {
-		return false
-	}
-
-	switch method {
-	case "POST", "PUT", "PATCH":
-		return true
-	default:
-		return false
-	}
 }
 
 func (cc *Http2ClientConn) writeHeader(name, value string) {
@@ -592,7 +586,7 @@ func (http2noBodyReader) Close() error { return nil }
 
 func (http2noBodyReader) Read([]byte) (int, error) { return 0, io.EOF }
 
-func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *http2MetaHeadersFrame) (*http.Response, error) {
+func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *Http2MetaHeadersFrame) (*http.Response, error) {
 	status := f.PseudoValue("status")
 	statusCode, err := strconv.Atoi(status)
 	if err != nil {
@@ -648,7 +642,7 @@ func (b http2transportResponseBody) Read(p []byte) (n int, err error) {
 func (b http2transportResponseBody) Close() error {
 	return b.cs.bodyReader.Close()
 }
-func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2DataFrame) (err error) {
+func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *Http2DataFrame) (err error) {
 	if f.Length > 0 {
 		if len(f.Data()) > 0 {
 			if _, err = cs.bodyWriter.Write(f.Data()); err != nil {
@@ -687,7 +681,7 @@ func (rl *http2clientConnReadLoop) processData(cs *http2clientStream, f *http2Da
 	return
 }
 
-func (rl *http2clientConnReadLoop) processWindowUpdate(f *http2WindowUpdateFrame) error {
+func (rl *http2clientConnReadLoop) processWindowUpdate(f *Http2WindowUpdateFrame) error {
 	rl.cc.wmu.Lock()
 	defer rl.cc.wmu.Unlock()
 	if f.StreamID == 0 {
@@ -698,7 +692,7 @@ func (rl *http2clientConnReadLoop) processWindowUpdate(f *http2WindowUpdateFrame
 	rl.cc.notice()
 	return nil
 }
-func (rl *http2clientConnReadLoop) processSettings(f *http2SettingsFrame) error {
+func (rl *http2clientConnReadLoop) processSettings(f *Http2SettingsFrame) error {
 	rl.cc.wmu.Lock()
 	defer rl.cc.wmu.Unlock()
 	if err := rl.processSettingsNoWrite(f); err != nil {
@@ -712,8 +706,8 @@ func (rl *http2clientConnReadLoop) processSettings(f *http2SettingsFrame) error 
 	}
 	return nil
 }
-func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame) error {
-	return f.ForeachSetting(func(s http2Setting) error {
+func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *Http2SettingsFrame) error {
+	return f.ForeachSetting(func(s Http2Setting) error {
 		switch s.ID {
 		case Http2SettingMaxFrameSize:
 			rl.cc.spec.maxFrameSize = s.Val
@@ -731,7 +725,7 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *http2SettingsFrame)
 	})
 }
 
-func (rl *http2clientConnReadLoop) processPing(f *http2PingFrame) error {
+func (rl *http2clientConnReadLoop) processPing(f *Http2PingFrame) error {
 	rl.cc.wmu.Lock()
 	defer rl.cc.wmu.Unlock()
 	if err := rl.cc.fr.WritePing(true, f.Data); err != nil {

@@ -144,7 +144,7 @@ const (
 type http2frameParser func(fc *http2frameCache, fh http2FrameHeader, payload []byte) (any, error)
 
 func http2parseHeadersFrame(_ *http2frameCache, fh http2FrameHeader, p []byte) (_ any, err error) {
-	hf := &http2HeadersFrame{
+	hf := &Http2HeadersFrame{
 		http2FrameHeader: fh,
 	}
 	var padLength uint8
@@ -264,12 +264,12 @@ func (f *http2Framer) writeUint32(v uint32) {
 }
 
 type http2frameCache struct {
-	dataFrame http2DataFrame
+	dataFrame Http2DataFrame
 }
 
-func (fc *http2frameCache) getDataFrame() *http2DataFrame {
+func (fc *http2frameCache) getDataFrame() *Http2DataFrame {
 	if fc == nil {
-		return &http2DataFrame{}
+		return &Http2DataFrame{}
 	}
 	return &fc.dataFrame
 }
@@ -303,13 +303,13 @@ func (fr *http2Framer) ReadFrame() (any, error) {
 		return nil, err
 	}
 	if fh.Type == http2FrameHeaders {
-		return fr.readMetaFrame(f.(*http2HeadersFrame))
+		return fr.readMetaFrame(f.(*Http2HeadersFrame))
 	}
 	return f, nil
 }
-func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (any, error) {
-	mh := &http2MetaHeadersFrame{
-		http2HeadersFrame: hf,
+func (fr *http2Framer) readMetaFrame(hf *Http2HeadersFrame) (any, error) {
+	mh := &Http2MetaHeadersFrame{
+		Http2HeadersFrame: hf,
 	}
 	fr.ReadMetaHeaders.SetEmitEnabled(true)
 	fr.ReadMetaHeaders.SetEmitFunc(func(hf hpack.HeaderField) {
@@ -334,23 +334,23 @@ func (fr *http2Framer) readMetaFrame(hf *http2HeadersFrame) (any, error) {
 			hc = f.(*http2ContinuationFrame)
 		}
 	}
-	mh.http2HeadersFrame.headerFragBuf = nil
+	mh.Http2HeadersFrame.headerFragBuf = nil
 	if err := fr.ReadMetaHeaders.Close(); err != nil {
 		return mh, http2ConnectionError(errHttp2CodeCompression)
 	}
 	return mh, nil
 }
 
-type http2DataFrame struct {
+type Http2DataFrame struct {
 	data []byte
 	http2FrameHeader
 }
 
-func (f *http2DataFrame) StreamEnded() bool {
+func (f *Http2DataFrame) StreamEnded() bool {
 	return f.http2FrameHeader.Flags.Has(http2FlagDataEndStream)
 }
 
-func (f *http2DataFrame) Data() []byte {
+func (f *Http2DataFrame) Data() []byte {
 	return f.data
 }
 
@@ -411,7 +411,7 @@ func (f *http2Framer) startWriteDataPadded(streamID uint32, endStream bool, data
 	return nil
 }
 
-type http2SettingsFrame struct {
+type Http2SettingsFrame struct {
 	p []byte
 	http2FrameHeader
 }
@@ -426,18 +426,18 @@ func http2parseSettingsFrame(_ *http2frameCache, fh http2FrameHeader, p []byte) 
 	if len(p)%6 != 0 {
 		return nil, http2ConnectionError(errHttp2CodeFrameSize)
 	}
-	f := &http2SettingsFrame{http2FrameHeader: fh, p: p}
+	f := &Http2SettingsFrame{http2FrameHeader: fh, p: p}
 	if v, ok := f.Value(Http2SettingInitialWindowSize); ok && v > (1<<31)-1 {
 		return nil, http2ConnectionError(errHttp2CodeFlowControl)
 	}
 	return f, nil
 }
 
-func (f *http2SettingsFrame) IsAck() bool {
+func (f *Http2SettingsFrame) IsAck() bool {
 	return f.http2FrameHeader.Flags.Has(http2FlagSettingsAck)
 }
 
-func (f *http2SettingsFrame) Value(id http2SettingID) (v uint32, ok bool) {
+func (f *Http2SettingsFrame) Value(id Http2SettingID) (v uint32, ok bool) {
 	for i := 0; i < f.NumSettings(); i++ {
 		if s := f.Setting(i); s.ID == id {
 			return s.Val, true
@@ -446,17 +446,17 @@ func (f *http2SettingsFrame) Value(id http2SettingID) (v uint32, ok bool) {
 	return 0, false
 }
 
-func (f *http2SettingsFrame) Setting(i int) http2Setting {
+func (f *Http2SettingsFrame) Setting(i int) Http2Setting {
 	buf := f.p
-	return http2Setting{
-		ID:  http2SettingID(binary.BigEndian.Uint16(buf[i*6 : i*6+2])),
+	return Http2Setting{
+		ID:  Http2SettingID(binary.BigEndian.Uint16(buf[i*6 : i*6+2])),
 		Val: binary.BigEndian.Uint32(buf[i*6+2 : i*6+6]),
 	}
 }
 
-func (f *http2SettingsFrame) NumSettings() int { return len(f.p) / 6 }
+func (f *Http2SettingsFrame) NumSettings() int { return len(f.p) / 6 }
 
-func (f *http2SettingsFrame) HasDuplicates() bool {
+func (f *Http2SettingsFrame) HasDuplicates() bool {
 	num := f.NumSettings()
 	if num == 0 {
 		return false
@@ -474,7 +474,7 @@ func (f *http2SettingsFrame) HasDuplicates() bool {
 		}
 		return false
 	}
-	seen := map[http2SettingID]bool{}
+	seen := map[Http2SettingID]bool{}
 	for i := 0; i < num; i++ {
 		id := f.Setting(i).ID
 		if seen[id] {
@@ -485,7 +485,7 @@ func (f *http2SettingsFrame) HasDuplicates() bool {
 	return false
 }
 
-func (f *http2SettingsFrame) ForeachSetting(fn func(http2Setting) error) error {
+func (f *Http2SettingsFrame) ForeachSetting(fn func(Http2Setting) error) error {
 	for i := 0; i < f.NumSettings(); i++ {
 		if err := fn(f.Setting(i)); err != nil {
 			return err
@@ -494,7 +494,7 @@ func (f *http2SettingsFrame) ForeachSetting(fn func(http2Setting) error) error {
 	return nil
 }
 
-func (f *http2Framer) WriteSettings(settings ...http2Setting) error {
+func (f *http2Framer) WriteSettings(settings ...Http2Setting) error {
 	f.startWrite(http2FrameSettings, 0, 0)
 	for _, s := range settings {
 		f.writeUint16(uint16(s.ID))
@@ -508,12 +508,12 @@ func (f *http2Framer) WriteSettingsAck() error {
 	return f.endWrite()
 }
 
-type http2PingFrame struct {
+type Http2PingFrame struct {
 	http2FrameHeader
 	Data [8]byte
 }
 
-func (f *http2PingFrame) IsAck() bool { return f.Flags.Has(http2FlagPingAck) }
+func (f *Http2PingFrame) IsAck() bool { return f.Flags.Has(http2FlagPingAck) }
 
 func http2parsePingFrame(_ *http2frameCache, fh http2FrameHeader, payload []byte) (any, error) {
 	if len(payload) != 8 {
@@ -522,7 +522,7 @@ func http2parsePingFrame(_ *http2frameCache, fh http2FrameHeader, payload []byte
 	if fh.StreamID != 0 {
 		return nil, http2ConnectionError(errHttp2CodeProtocol)
 	}
-	f := &http2PingFrame{http2FrameHeader: fh}
+	f := &Http2PingFrame{http2FrameHeader: fh}
 	copy(f.Data[:], payload)
 	return f, nil
 }
@@ -537,7 +537,7 @@ func (f *http2Framer) WritePing(ack bool, data [8]byte) error {
 	return f.endWrite()
 }
 
-type http2GoAwayFrame struct {
+type Http2GoAwayFrame struct {
 	debugData []byte
 	http2FrameHeader
 	LastStreamID uint32
@@ -551,7 +551,7 @@ func http2parseGoAwayFrame(_ *http2frameCache, fh http2FrameHeader, p []byte) (a
 	if len(p) < 8 {
 		return nil, http2ConnectionError(errHttp2CodeFrameSize)
 	}
-	return &http2GoAwayFrame{
+	return &Http2GoAwayFrame{
 		http2FrameHeader: fh,
 		LastStreamID:     binary.BigEndian.Uint32(p[:4]) & (1<<31 - 1),
 		ErrCode:          errHttp2Code(binary.BigEndian.Uint32(p[4:8])),
@@ -572,7 +572,7 @@ func http2parseUnknownFrame(_ *http2frameCache, fh http2FrameHeader, p []byte) (
 	return &http2UnknownFrame{p, fh}, nil
 }
 
-type http2WindowUpdateFrame struct {
+type Http2WindowUpdateFrame struct {
 	http2FrameHeader
 	Increment uint32
 }
@@ -581,7 +581,7 @@ func http2parseWindowUpdateFrame(_ *http2frameCache, fh http2FrameHeader, p []by
 	if len(p) != 4 {
 		return nil, http2ConnectionError(errHttp2CodeFrameSize)
 	}
-	return &http2WindowUpdateFrame{
+	return &Http2WindowUpdateFrame{
 		http2FrameHeader: fh,
 		Increment:        binary.BigEndian.Uint32(p[:4]) & 0x7fffffff,
 	}, nil
@@ -593,25 +593,25 @@ func (f *http2Framer) WriteWindowUpdate(streamID, incr uint32) error {
 	return f.endWrite()
 }
 
-type http2HeadersFrame struct {
+type Http2HeadersFrame struct {
 	headerFragBuf []byte
 	http2FrameHeader
 	Priority http2PriorityParam
 }
 
-func (f *http2HeadersFrame) HeaderBlockFragment() []byte {
+func (f *Http2HeadersFrame) HeaderBlockFragment() []byte {
 	return f.headerFragBuf
 }
 
-func (f *http2HeadersFrame) HeadersEnded() bool {
+func (f *Http2HeadersFrame) HeadersEnded() bool {
 	return f.http2FrameHeader.Flags.Has(http2FlagHeadersEndHeaders)
 }
 
-func (f *http2HeadersFrame) StreamEnded() bool {
+func (f *Http2HeadersFrame) StreamEnded() bool {
 	return f.http2FrameHeader.Flags.Has(http2FlagHeadersEndStream)
 }
 
-type http2HeadersFrameParam struct {
+type Http2HeadersFrameParam struct {
 	BlockFragment []byte
 	Priority      http2PriorityParam
 	StreamID      uint32
@@ -620,7 +620,7 @@ type http2HeadersFrameParam struct {
 	PadLength     uint8
 }
 
-func (f *http2Framer) WriteHeaders(p http2HeadersFrameParam) error {
+func (f *http2Framer) WriteHeaders(p Http2HeadersFrameParam) error {
 	var flags http2Flags
 	if p.PadLength != 0 {
 		flags |= http2FlagHeadersPadded
@@ -698,7 +698,7 @@ func (f *http2Framer) WritePriority(streamID uint32, p http2PriorityParam) error
 	return f.endWrite()
 }
 
-type http2RSTStreamFrame struct {
+type Http2RSTStreamFrame struct {
 	http2FrameHeader
 	ErrCode errHttp2Code
 }
@@ -710,7 +710,7 @@ func http2parseRSTStreamFrame(_ *http2frameCache, fh http2FrameHeader, p []byte)
 	if fh.StreamID == 0 {
 		return nil, http2ConnectionError(errHttp2CodeProtocol)
 	}
-	return &http2RSTStreamFrame{fh, errHttp2Code(binary.BigEndian.Uint32(p[:4]))}, nil
+	return &Http2RSTStreamFrame{fh, errHttp2Code(binary.BigEndian.Uint32(p[:4]))}, nil
 }
 
 func (f *http2Framer) WriteRSTStream(streamID uint32, code errHttp2Code) error {
@@ -749,22 +749,22 @@ func (f *http2Framer) WriteContinuation(streamID uint32, endHeaders bool, header
 	return f.endWrite()
 }
 
-type http2PushPromiseFrame struct {
+type Http2PushPromiseFrame struct {
 	headerFragBuf []byte
 	http2FrameHeader
 	PromiseID uint32
 }
 
-func (f *http2PushPromiseFrame) HeaderBlockFragment() []byte {
+func (f *Http2PushPromiseFrame) HeaderBlockFragment() []byte {
 	return f.headerFragBuf
 }
 
-func (f *http2PushPromiseFrame) HeadersEnded() bool {
+func (f *Http2PushPromiseFrame) HeadersEnded() bool {
 	return f.http2FrameHeader.Flags.Has(http2FlagPushPromiseEndHeaders)
 }
 
 func http2parsePushPromise(_ *http2frameCache, fh http2FrameHeader, p []byte) (_ any, err error) {
-	pp := &http2PushPromiseFrame{
+	pp := &Http2PushPromiseFrame{
 		http2FrameHeader: fh,
 	}
 	if pp.StreamID == 0 {
@@ -849,13 +849,12 @@ type http2headersOrContinuation interface {
 	HeaderBlockFragment() []byte
 }
 
-type http2MetaHeadersFrame struct {
-	*http2HeadersFrame
-
+type Http2MetaHeadersFrame struct {
+	*Http2HeadersFrame
 	Fields []hpack.HeaderField
 }
 
-func (mh *http2MetaHeadersFrame) PseudoValue(pseudo string) string {
+func (mh *Http2MetaHeadersFrame) PseudoValue(pseudo string) string {
 	for _, hf := range mh.Fields {
 		if !hf.IsPseudo() {
 			return ""
@@ -867,7 +866,7 @@ func (mh *http2MetaHeadersFrame) PseudoValue(pseudo string) string {
 	return ""
 }
 
-func (mh *http2MetaHeadersFrame) RegularFields() []hpack.HeaderField {
+func (mh *Http2MetaHeadersFrame) RegularFields() []hpack.HeaderField {
 	for i, hf := range mh.Fields {
 		if !hf.IsPseudo() {
 			return mh.Fields[i:]
@@ -876,7 +875,7 @@ func (mh *http2MetaHeadersFrame) RegularFields() []hpack.HeaderField {
 	return nil
 }
 
-func (mh *http2MetaHeadersFrame) PseudoFields() []hpack.HeaderField {
+func (mh *Http2MetaHeadersFrame) PseudoFields() []hpack.HeaderField {
 	for i, hf := range mh.Fields {
 		if !hf.IsPseudo() {
 			return mh.Fields[:i]
@@ -885,19 +884,19 @@ func (mh *http2MetaHeadersFrame) PseudoFields() []hpack.HeaderField {
 	return mh.Fields
 }
 
-type http2Setting struct {
-	ID http2SettingID
+type Http2Setting struct {
+	ID Http2SettingID
 
 	Val uint32
 }
 
-type http2SettingID uint16
+type Http2SettingID uint16
 
 const (
-	Http2SettingHeaderTableSize   http2SettingID = 0x1
-	Http2SettingInitialWindowSize http2SettingID = 0x4
-	Http2SettingMaxFrameSize      http2SettingID = 0x5
-	Http2SettingMaxHeaderListSize http2SettingID = 0x6
+	Http2SettingHeaderTableSize   Http2SettingID = 0x1
+	Http2SettingInitialWindowSize Http2SettingID = 0x4
+	Http2SettingMaxFrameSize      Http2SettingID = 0x5
+	Http2SettingMaxHeaderListSize Http2SettingID = 0x6
 )
 
 func http2validPseudoPath(v string) bool {
