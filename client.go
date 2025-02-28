@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gospider007/ja3"
 	"github.com/gospider007/tools"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
@@ -124,8 +123,6 @@ func (cc *Http2ClientConn) run() (err error) {
 				return tools.WrapError(err, "processSettings")
 			}
 		case *Http2PushPromiseFrame:
-			err = http2ConnectionError(errHttp2CodeProtocol)
-			return tools.WrapError(err, "processPushPromise")
 		case *Http2WindowUpdateFrame:
 			if err = cc.loop.processWindowUpdate(f); err != nil {
 				return tools.WrapError(err, "processWindowUpdate")
@@ -153,8 +150,8 @@ func (cc *Http2ClientConn) run() (err error) {
 }
 
 type gospiderOption struct {
-	initialSetting    []ja3.Setting
-	priority          ja3.Priority
+	initialSetting    []Http2Setting
+	priority          Http2PriorityParam
 	connFlow          uint32
 	initialWindowSize uint32
 	headerTableSize   uint32
@@ -162,65 +159,65 @@ type gospiderOption struct {
 	maxFrameSize      uint32
 }
 
-func spec2option(h2Spec ja3.HSpec) (option gospiderOption) {
-	option.initialSetting = h2Spec.InitialSetting
-	option.priority = ja3.Priority{
-		Exclusive: true,
-		StreamDep: 0,
-		Weight:    255,
-	}
-	option.headerTableSize = 65536
-	option.maxHeaderListSize = 262144
-	option.initialWindowSize = 6291456
-	option.maxFrameSize = 16384
-	option.connFlow = 15663105
-
-	// //golang setting: start
-	// option.initialWindowSize = 4194304
-	// option.maxFrameSize = 16384
-	// option.maxHeaderListSize = 10485760
-	// option.initialSetting = []ja3.Setting{
-	// 	{Id: 2, Val: 0},
-	// 	{Id: 4, Val: option.initialWindowSize},
-	// 	{Id: 5, Val: option.maxFrameSize},
-	// 	{Id: 6, Val: option.maxHeaderListSize},
-	// }
-	// option.priority = ja3.Priority{}
-	// option.connFlow = 1073741824
-	// option.headerTableSize = 4096
-	// //golang setting: end
-
-	if len(option.initialSetting) > 0 {
-		for _, setting := range option.initialSetting {
-			switch setting.Id {
-			case ja3.Http2SettingHeaderTableSize:
-				option.headerTableSize = setting.Val
-			case ja3.Http2SettingMaxHeaderListSize:
-				option.maxHeaderListSize = setting.Val
-			case ja3.Http2SettingInitialWindowSize:
-				option.initialWindowSize = setting.Val
-			case ja3.Http2SettingMaxFrameSize:
-				option.maxFrameSize = setting.Val
-			}
+func spec2option(h2Spec *Spec) (option gospiderOption) {
+	if h2Spec == nil {
+		//golang setting: start
+		option.initialWindowSize = 4194304
+		option.maxFrameSize = 16384
+		option.maxHeaderListSize = 10485760
+		option.initialSetting = []Http2Setting{
+			{ID: 2, Val: 0},
+			{ID: 4, Val: option.initialWindowSize},
+			{ID: 5, Val: option.maxFrameSize},
+			{ID: 6, Val: option.maxHeaderListSize},
 		}
+		option.priority = Http2PriorityParam{}
+		option.connFlow = 1073741824
+		option.headerTableSize = 4096
+		h2Spec = nil
+		//golang setting: end
 	} else {
-		option.initialSetting = []ja3.Setting{
-			{Id: ja3.Http2SettingHeaderTableSize, Val: option.headerTableSize},
-			{Id: ja3.Http2SettingEnablePush, Val: 0},
-			{Id: ja3.Http2SettingInitialWindowSize, Val: option.initialWindowSize},
-			{Id: ja3.Http2SettingMaxHeaderListSize, Val: option.maxHeaderListSize},
+		option.initialSetting = h2Spec.Settings
+		option.priority = h2Spec.Priority
+		option.headerTableSize = 65536
+		option.maxHeaderListSize = 262144
+		option.initialWindowSize = 6291456
+		option.maxFrameSize = 16384
+		if h2Spec.ConnFlow > 0 {
+			option.connFlow = h2Spec.ConnFlow
+		} else {
+			option.connFlow = 15663105
+		}
+	}
+	for _, setting := range option.initialSetting {
+		switch setting.ID {
+		case Http2SettingHeaderTableSize:
+			option.headerTableSize = setting.Val
+		case Http2SettingMaxHeaderListSize:
+			option.maxHeaderListSize = setting.Val
+		case Http2SettingInitialWindowSize:
+			option.initialWindowSize = setting.Val
+		case Http2SettingMaxFrameSize:
+			option.maxFrameSize = setting.Val
 		}
 	}
 	return option
 }
 
-func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun func(error)) (*Http2ClientConn, error) {
+func NewClientConn(ctx context.Context, c net.Conn, h2Spec *Spec, closefun func(error)) (*Http2ClientConn, error) {
+	var streamID uint32
+	if h2Spec != nil {
+		streamID = h2Spec.StreamID
+	} else {
+		streamID = 1
+	}
 	spec := spec2option(h2Spec)
 	cc := &Http2ClientConn{
 		closeFunc:   closefun,
 		spec:        spec,
 		tconn:       c,
 		flowNotices: make(chan struct{}, 1),
+		streamID:    streamID,
 	}
 	cc.closeCtx, cc.closeCnl = context.WithCancelCause(context.TODO())
 	cc.bw = bufio.NewWriter(c)
@@ -228,24 +225,28 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec ja3.HSpec, closefun f
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(cc.spec.headerTableSize, nil)
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
 	cc.henc.SetMaxDynamicTableSizeLimit(cc.spec.headerTableSize)
-	initialSettings := make([]Http2Setting, len(cc.spec.initialSetting))
-	for i, setting := range cc.spec.initialSetting {
-		initialSettings[i] = Http2Setting{ID: Http2SettingID(setting.Id), Val: setting.Val}
-	}
 	cc.spec.initialWindowSize = 65535
 	cc.flow.add(int32(cc.spec.initialWindowSize))
 	done := make(chan struct{})
 	var err error
 	go func() {
 		defer close(done)
-		if _, err = cc.bw.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
-			return
-		}
-		if err = cc.fr.WriteSettings(initialSettings...); err != nil {
-			return
-		}
-		if err = cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
-			return
+		if h2Spec != nil && len(h2Spec.initData) > 0 {
+			rawData := []byte(fmt.Sprintf("%s\r\n\r\n%s\r\n\r\n", h2Spec.Pri, h2Spec.Sm))
+			rawData = append(rawData, h2Spec.initData...)
+			if _, err = cc.bw.Write(rawData); err != nil {
+				return
+			}
+		} else {
+			if _, err = cc.bw.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
+				return
+			}
+			if err = cc.fr.WriteSettings(cc.spec.initialSetting...); err != nil {
+				return
+			}
+			if err = cc.fr.WriteWindowUpdate(0, cc.spec.connFlow); err != nil {
+				return
+			}
 		}
 		cc.inflow.init(int32(cc.spec.connFlow) + int32(cc.spec.initialWindowSize))
 		if err = cc.bw.Flush(); err != nil {
@@ -291,11 +292,6 @@ func http2actualContentLength(req *http.Request) int64 {
 func (cc *Http2ClientConn) initStream(req *http.Request) {
 	cc.wmu.Lock()
 	defer cc.wmu.Unlock()
-	if cc.streamID == 0 {
-		cc.streamID = 1
-	} else {
-		cc.streamID += 2
-	}
 	reader, writer := io.Pipe()
 	cs := &http2clientStream{
 		cc:         cc,
@@ -306,12 +302,12 @@ func (cc *Http2ClientConn) initStream(req *http.Request) {
 	cs.writeCtx, cs.writeCnl = context.WithCancel(cc.closeCtx)
 	cs.readCtx, cs.readCnl = context.WithCancelCause(cc.closeCtx)
 	cs.ctx, cs.cnl = context.WithCancel(req.Context())
-
 	cc.http2clientStream = cs
-	cs.inflow.init(int32(cs.cc.spec.initialWindowSize))
-	cs.flow.add(int32(cs.cc.spec.initialWindowSize))
-	cs.flow.setConnFlow(&cs.cc.flow)
-	cs.ID = cs.cc.streamID
+	cs.inflow.init(int32(cc.spec.initialWindowSize))
+	cs.flow.add(int32(cc.spec.initialWindowSize))
+	cs.flow.setConnFlow(&cc.flow)
+	cs.ID = cc.streamID
+	cc.streamID += 2
 }
 
 func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []interface {
@@ -386,7 +382,7 @@ func (cc *Http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFram
 				EndHeaders:    endHeaders,
 			}
 			if cc.spec.priority.StreamDep != 0 || cc.spec.priority.Weight != 0 || cc.spec.priority.Exclusive {
-				http2HeadersFrameParam.Priority = http2PriorityParam{
+				http2HeadersFrameParam.Priority = Http2PriorityParam{
 					StreamDep: cc.spec.priority.StreamDep,
 					Exclusive: cc.spec.priority.Exclusive,
 					Weight:    cc.spec.priority.Weight,

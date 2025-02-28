@@ -596,7 +596,7 @@ func (f *http2Framer) WriteWindowUpdate(streamID, incr uint32) error {
 type Http2HeadersFrame struct {
 	headerFragBuf []byte
 	http2FrameHeader
-	Priority http2PriorityParam
+	Priority Http2PriorityParam
 }
 
 func (f *Http2HeadersFrame) HeaderBlockFragment() []byte {
@@ -613,7 +613,7 @@ func (f *Http2HeadersFrame) StreamEnded() bool {
 
 type Http2HeadersFrameParam struct {
 	BlockFragment []byte
-	Priority      http2PriorityParam
+	Priority      Http2PriorityParam
 	StreamID      uint32
 	EndStream     bool
 	EndHeaders    bool
@@ -653,10 +653,10 @@ func (f *http2Framer) WriteHeaders(p Http2HeadersFrameParam) error {
 
 type http2PriorityFrame struct {
 	http2FrameHeader
-	http2PriorityParam
+	Http2PriorityParam
 }
 
-type http2PriorityParam struct {
+type Http2PriorityParam struct {
 	StreamDep uint32
 
 	Exclusive bool
@@ -664,8 +664,8 @@ type http2PriorityParam struct {
 	Weight uint8
 }
 
-func (p http2PriorityParam) IsZero() bool {
-	return p == http2PriorityParam{}
+func (p Http2PriorityParam) IsZero() bool {
+	return p == Http2PriorityParam{}
 }
 
 func http2parsePriorityFrame(_ *http2frameCache, fh http2FrameHeader, payload []byte) (any, error) {
@@ -679,7 +679,7 @@ func http2parsePriorityFrame(_ *http2frameCache, fh http2FrameHeader, payload []
 	streamID := v & 0x7fffffff
 	return &http2PriorityFrame{
 		http2FrameHeader: fh,
-		http2PriorityParam: http2PriorityParam{
+		Http2PriorityParam: Http2PriorityParam{
 			Weight:    payload[4],
 			StreamDep: streamID,
 			Exclusive: streamID != v,
@@ -687,7 +687,7 @@ func http2parsePriorityFrame(_ *http2frameCache, fh http2FrameHeader, payload []
 	}, nil
 }
 
-func (f *http2Framer) WritePriority(streamID uint32, p http2PriorityParam) error {
+func (f *http2Framer) WritePriority(streamID uint32, p Http2PriorityParam) error {
 	f.startWrite(http2FramePriority, 0, streamID)
 	v := p.StreamDep
 	if p.Exclusive {
