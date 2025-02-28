@@ -13,7 +13,7 @@ type Spec struct {
 	Sm           string
 	Settings     []Http2Setting
 	ConnFlow     uint32
-	OrderHeaders []string
+	OrderHeaders [][2]string
 	Priority     Http2PriorityParam
 	StreamID     uint32
 	raw          []byte
@@ -126,7 +126,7 @@ func ParseSpec(raw []byte) (*Spec, error) {
 	rawContent = rawContent[i+4:]
 	r := bytes.NewReader(rawContent)
 	reader := Http2NewReaderFramer(r)
-	var orderHeaders []string
+	var orderHeaders [][2]string
 	settings := []Http2Setting{}
 	var jq int
 	var connFlow uint32
@@ -144,9 +144,12 @@ readF:
 		}
 		switch frame := f.(type) {
 		case *Http2MetaHeadersFrame:
-			names := []string{}
+			names := [][2]string{}
 			for _, hf := range frame.RegularFields() {
-				names = append(names, hf.Name)
+				names = append(names, [2]string{
+					hf.Name,
+					hf.Value,
+				})
 			}
 			orderHeaders = names
 			priority = frame.Priority
