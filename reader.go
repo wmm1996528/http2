@@ -29,6 +29,22 @@ func Http2NewReaderFramer(r io.Reader) *Http2ReaderFramer {
 	}
 	return fr
 }
+
+func (fr *Http2ReaderFramer) ReadRawFrame() (any, []byte, error) {
+	fh, err := http2readFrameHeader(fr.headerBuf[:], fr.r)
+	if err != nil {
+		return nil, nil, err
+	}
+	payload := fr.getReadBuf(fh.Length)
+	if _, err := io.ReadFull(fr.r, payload); err != nil {
+		return nil, nil, err
+	}
+	data := fr.headerBuf[:http2frameHeaderLen]
+	data = append(data, payload...)
+	v, err := http2typeFrameParser(fh.Type)(fr.frameCache, fh, payload)
+	return v, data, err
+}
+
 func (fr *Http2ReaderFramer) ReadFrame() (any, error) {
 	fh, err := http2readFrameHeader(fr.headerBuf[:], fr.r)
 	if err != nil {

@@ -715,6 +715,7 @@ func (rl *http2clientConnReadLoop) processSettingsNoWrite(f *Http2SettingsFrame)
 			rl.cc.spec.initialWindowSize = s.Val
 		case Http2SettingHeaderTableSize:
 			rl.cc.henc.SetMaxDynamicTableSize(s.Val)
+			rl.cc.fr.ReadMetaHeaders.SetMaxDynamicTableSize(s.Val)
 		default:
 		}
 		return nil
