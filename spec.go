@@ -35,7 +35,7 @@ func (obj *Spec) Map() map[string]any {
 	streams := []map[string]any{}
 readF:
 	for {
-		f, err := reader.ReadFrame()
+		f, _, err := reader.ReadFrame()
 		if err != nil {
 			break readF
 		}
@@ -123,19 +123,17 @@ func ParseSpec(raw []byte) (*Spec, error) {
 		return nil, errors.New("not found \\r\\n")
 	}
 	sm := rawContent[:i]
-	rawContent = rawContent[i+4:]
-	r := bytes.NewReader(rawContent)
-	reader := Http2NewReaderFramer(r)
+	reader := Http2NewReaderFramer(bytes.NewReader(rawContent[i+4:]))
 	var orderHeaders [][2]string
 	settings := []Http2Setting{}
-	var jq int
 	var connFlow uint32
 	var streamID uint32
 	var priority Http2PriorityParam
 	var ok bool
+	initData := []byte{}
 readF:
 	for {
-		f, err := reader.ReadFrame()
+		f, data, err := reader.ReadFrame()
 		if err != nil {
 			if err == io.EOF {
 				break readF
@@ -163,18 +161,20 @@ readF:
 		case *Http2RSTStreamFrame:
 			return nil, errors.New("Http2RSTStreamFrame")
 		case *Http2SettingsFrame:
-			jq = r.Len()
-			frame.ForeachSetting(func(hs Http2Setting) error {
-				settings = append(settings, hs)
-				return nil
-			})
+			if !frame.IsAck() {
+				initData = append(initData, data...)
+				frame.ForeachSetting(func(hs Http2Setting) error {
+					settings = append(settings, hs)
+					return nil
+				})
+			}
 		case *Http2PushPromiseFrame:
 			return nil, errors.New("Http2PushPromiseFrame")
 		case *Http2WindowUpdateFrame:
-			jq = r.Len()
+			initData = append(initData, data...)
 			connFlow = frame.Increment
 		case *Http2PingFrame:
-			jq = r.Len()
+			initData = append(initData, data...)
 		default:
 			return nil, errors.New("Http2UnknownFramep")
 		}
@@ -190,7 +190,7 @@ readF:
 		ConnFlow:     connFlow,
 		OrderHeaders: orderHeaders,
 		Priority:     priority,
-		initData:     rawContent[:len(rawContent)-jq],
+		initData:     initData,
 		StreamID:     streamID,
 	}, nil
 }

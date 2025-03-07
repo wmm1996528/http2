@@ -30,7 +30,7 @@ func Http2NewReaderFramer(r io.Reader) *Http2ReaderFramer {
 	return fr
 }
 
-func (fr *Http2ReaderFramer) ReadRawFrame() (any, []byte, error) {
+func (fr *Http2ReaderFramer) ReadFrame() (any, []byte, error) {
 	fh, err := http2readFrameHeader(fr.headerBuf[:], fr.r)
 	if err != nil {
 		return nil, nil, err
@@ -41,22 +41,9 @@ func (fr *Http2ReaderFramer) ReadRawFrame() (any, []byte, error) {
 	}
 	data := fr.headerBuf[:http2frameHeaderLen]
 	data = append(data, payload...)
-	v, err := http2typeFrameParser(fh.Type)(fr.frameCache, fh, payload)
-	return v, data, err
-}
-
-func (fr *Http2ReaderFramer) ReadFrame() (any, error) {
-	fh, err := http2readFrameHeader(fr.headerBuf[:], fr.r)
-	if err != nil {
-		return nil, err
-	}
-	payload := fr.getReadBuf(fh.Length)
-	if _, err := io.ReadFull(fr.r, payload); err != nil {
-		return nil, err
-	}
 	f, err := http2typeFrameParser(fh.Type)(fr.frameCache, fh, payload)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if setting, ok := f.(*Http2SettingsFrame); ok {
 		setting.ForeachSetting(
@@ -69,11 +56,16 @@ func (fr *Http2ReaderFramer) ReadFrame() (any, error) {
 		)
 	}
 	if fh.Type == http2FrameHeaders {
-		return fr.readMetaFrame(f.(*Http2HeadersFrame))
+		f2, data2, err2 := fr.readMetaFrame(f.(*Http2HeadersFrame))
+		if err2 != nil {
+			return nil, nil, err2
+		}
+		data = append(data, data2...)
+		return f2, data, nil
 	}
-	return f, nil
+	return f, data, nil
 }
-func (fr *Http2ReaderFramer) readMetaFrame(hf *Http2HeadersFrame) (any, error) {
+func (fr *Http2ReaderFramer) readMetaFrame(hf *Http2HeadersFrame) (any, []byte, error) {
 	mh := &Http2MetaHeadersFrame{
 		Http2HeadersFrame: hf,
 	}
@@ -86,23 +78,25 @@ func (fr *Http2ReaderFramer) readMetaFrame(hf *Http2HeadersFrame) (any, error) {
 		fr.ReadMetaHeaders.SetEmitFunc(nil)
 	}()
 	var hc http2headersOrContinuation = hf
+	allData := []byte{}
 	for {
 		frag := hc.HeaderBlockFragment()
 		if _, err := fr.ReadMetaHeaders.Write(frag); err != nil {
-			return mh, http2ConnectionError(errHttp2CodeCompression)
+			return mh, nil, http2ConnectionError(errHttp2CodeCompression)
 		}
 		if hc.HeadersEnded() {
 			break
 		}
-		if f, err := fr.ReadFrame(); err != nil {
-			return nil, err
+		if f, data, err := fr.ReadFrame(); err != nil {
+			return nil, nil, err
 		} else {
 			hc = f.(*http2ContinuationFrame)
+			allData = append(allData, data...)
 		}
 	}
 	mh.Http2HeadersFrame.headerFragBuf = nil
 	if err := fr.ReadMetaHeaders.Close(); err != nil {
-		return mh, http2ConnectionError(errHttp2CodeCompression)
+		return mh, nil, http2ConnectionError(errHttp2CodeCompression)
 	}
-	return mh, nil
+	return mh, allData, nil
 }
