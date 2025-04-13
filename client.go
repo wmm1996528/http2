@@ -53,19 +53,21 @@ func (obj *Http2ClientConn) Stream() io.ReadWriteCloser {
 	return nil
 }
 
+type respC struct {
+	resp *http.Response
+	err  error
+}
+
 type http2clientStream struct {
-	cc         *Http2ClientConn
-	resp       *http.Response
-	req        *http.Request
+	cc *Http2ClientConn
+
 	bodyReader *io.PipeReader
 	bodyWriter *io.PipeWriter
 	ID         uint32
 	inflow     http2inflow
 	flow       http2outflow
 
-	err error
-	ctx context.Context
-	cnl context.CancelFunc
+	respDone chan *respC
 
 	writeCtx context.Context
 	writeCnl context.CancelFunc
@@ -95,8 +97,14 @@ func (cc *Http2ClientConn) run() (err error) {
 			if cc.http2clientStream == nil {
 				return tools.WrapError(errors.New("unexpected meta headers frame"), "run")
 			}
-			cc.http2clientStream.resp, err = cc.loop.handleResponse(cc.http2clientStream, f)
-			cc.http2clientStream.cnl()
+			resp, err := cc.loop.handleResponse(cc.http2clientStream, f)
+			select {
+			case cc.http2clientStream.respDone <- &respC{resp: resp, err: err}:
+			default:
+				if err == nil {
+					err = fmt.Errorf("response channel is full")
+				}
+			}
 			if err != nil {
 				return tools.WrapError(err, "handleResponse")
 			}
@@ -273,7 +281,6 @@ func (cc *Http2ClientConn) CloseWithError(err error) error {
 	}
 	cc.tconn.Close()
 	if cc.http2clientStream != nil {
-		cc.http2clientStream.cnl()
 		cc.http2clientStream.bodyWriter.CloseWithError(err)
 	}
 	return nil
@@ -289,7 +296,7 @@ func http2actualContentLength(req *http.Request) int64 {
 	return -1
 }
 
-func (cc *Http2ClientConn) initStream(req *http.Request) {
+func (cc *Http2ClientConn) initStream() {
 	cc.wmu.Lock()
 	defer cc.wmu.Unlock()
 	reader, writer := io.Pipe()
@@ -297,11 +304,9 @@ func (cc *Http2ClientConn) initStream(req *http.Request) {
 		cc:         cc,
 		bodyReader: reader,
 		bodyWriter: writer,
-		req:        req,
 	}
 	cs.writeCtx, cs.writeCnl = context.WithCancel(cc.closeCtx)
 	cs.readCtx, cs.readCnl = context.WithCancelCause(cc.closeCtx)
-	cs.ctx, cs.cnl = context.WithCancel(req.Context())
 	cc.http2clientStream = cs
 	cs.inflow.init(int32(cc.spec.initialWindowSize))
 	cs.flow.add(int32(cc.spec.initialWindowSize))
@@ -322,13 +327,13 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []interface
 	if cc.shutdownErr != nil {
 		return nil, nil, cc.shutdownErr
 	}
-	cc.initStream(req)
+	cc.initStream()
 	go cc.http2clientStream.writeRequest(req, orderHeaders)
 	select {
 	case <-cc.CloseCtx().Done():
-		return cc.http2clientStream.resp, cc.http2clientStream.readCtx, cc.http2clientStream.err
-	case <-cc.http2clientStream.ctx.Done():
-		return cc.http2clientStream.resp, cc.http2clientStream.readCtx, cc.http2clientStream.err
+		return nil, nil, cc.CloseCtx().Err()
+	case respData := <-cc.http2clientStream.respDone:
+		return respData.resp, cc.http2clientStream.readCtx, respData.err
 	case <-req.Context().Done():
 		return nil, nil, req.Context().Err()
 	}
@@ -347,7 +352,7 @@ func (cs *http2clientStream) writeRequest(req *http.Request, orderHeaders []inte
 	if err = cs.encodeAndWriteHeaders(req, orderHeaders); err != nil {
 		return err
 	}
-	if http2actualContentLength(cs.req) != 0 {
+	if http2actualContentLength(req) != 0 {
 		return cs.writeRequestBody(req)
 	}
 	return
@@ -401,13 +406,13 @@ func (cc *Http2ClientConn) writeHeaders(streamID uint32, endStream bool, maxFram
 	return cc.bw.Flush()
 }
 
-func (cs *http2clientStream) frameScratchBufferLen(maxFrameSize int) int {
+func (cs *http2clientStream) frameScratchBufferLen(req *http.Request, maxFrameSize int) int {
 	const max = 512 << 10
 	n := int64(maxFrameSize)
 	if n > max {
 		n = max
 	}
-	if cl := http2actualContentLength(cs.req); cl != -1 && cl+1 < n {
+	if cl := http2actualContentLength(req); cl != -1 && cl+1 < n {
 		n = cl + 1
 	}
 	if n < 1 {
@@ -450,7 +455,7 @@ func (cs *http2clientStream) awaitFlowControl(maxBytes int) (taken int32, err er
 }
 
 func (cs *http2clientStream) writeRequestBody(req *http.Request) (bodyErr error) {
-	buf := make([]byte, cs.frameScratchBufferLen(int(cs.cc.spec.maxFrameSize)))
+	buf := make([]byte, cs.frameScratchBufferLen(req, int(cs.cc.spec.maxFrameSize)))
 	for {
 		n, err := req.Body.Read(buf)
 		if n > 0 {
@@ -595,7 +600,6 @@ func (rl *http2clientConnReadLoop) handleResponse(cs *http2clientStream, f *Http
 		Header:     make(http.Header),
 		StatusCode: statusCode,
 		Status:     status + " " + http.StatusText(statusCode),
-		Request:    cs.req,
 	}
 	for _, hf := range regularFields {
 		key := http.CanonicalHeaderKey(hf.Name)
