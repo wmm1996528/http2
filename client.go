@@ -100,10 +100,8 @@ func (cc *Http2ClientConn) run() (err error) {
 			resp, err := cc.loop.handleResponse(cc.http2clientStream, f)
 			select {
 			case cc.http2clientStream.respDone <- &respC{resp: resp, err: err}:
-			default:
-				if err == nil {
-					err = fmt.Errorf("response channel is full")
-				}
+			case <-cc.CloseCtx().Done():
+				err = cc.CloseCtx().Err()
 			}
 			if err != nil {
 				return tools.WrapError(err, "handleResponse")
@@ -304,6 +302,7 @@ func (cc *Http2ClientConn) initStream() {
 		cc:         cc,
 		bodyReader: reader,
 		bodyWriter: writer,
+		respDone:   make(chan *respC),
 	}
 	cs.writeCtx, cs.writeCnl = context.WithCancel(cc.closeCtx)
 	cs.readCtx, cs.readCnl = context.WithCancelCause(cc.closeCtx)
@@ -330,10 +329,10 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []interface
 	cc.initStream()
 	go cc.http2clientStream.writeRequest(req, orderHeaders)
 	select {
-	case <-cc.CloseCtx().Done():
-		return nil, nil, cc.CloseCtx().Err()
 	case respData := <-cc.http2clientStream.respDone:
 		return respData.resp, cc.http2clientStream.readCtx, respData.err
+	case <-cc.CloseCtx().Done():
+		return nil, nil, cc.CloseCtx().Err()
 	case <-req.Context().Done():
 		return nil, nil, req.Context().Err()
 	}
