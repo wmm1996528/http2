@@ -41,14 +41,11 @@ type Http2ClientConn struct {
 	streamID uint32
 
 	flowNotices chan struct{}
-	closeCtx    context.Context
-	closeCnl    context.CancelCauseFunc
+	ctx         context.Context
+	cnl         context.CancelCauseFunc
 	shutdownErr error
 }
 
-func (cc *Http2ClientConn) CloseCtx() context.Context {
-	return cc.closeCtx
-}
 func (obj *Http2ClientConn) Stream() io.ReadWriteCloser {
 	return nil
 }
@@ -100,8 +97,8 @@ func (cc *Http2ClientConn) run() (err error) {
 			resp, err := cc.loop.handleResponse(cc.http2clientStream, f)
 			select {
 			case cc.http2clientStream.respDone <- &respC{resp: resp, err: err}:
-			case <-cc.CloseCtx().Done():
-				err = cc.CloseCtx().Err()
+			case <-cc.ctx.Done():
+				err = cc.ctx.Err()
 			}
 			if err != nil {
 				return tools.WrapError(err, "handleResponse")
@@ -225,7 +222,7 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec *Spec, closefun func(
 		flowNotices: make(chan struct{}, 1),
 		streamID:    streamID,
 	}
-	cc.closeCtx, cc.closeCnl = context.WithCancelCause(context.TODO())
+	cc.ctx, cc.cnl = context.WithCancelCause(context.TODO())
 	cc.bw = bufio.NewWriter(c)
 	cc.fr = http2NewFramer(cc.bw, bufio.NewReader(c))
 	cc.fr.ReadMetaHeaders = hpack.NewDecoder(cc.spec.headerTableSize, nil)
@@ -273,10 +270,10 @@ func NewClientConn(ctx context.Context, c net.Conn, h2Spec *Spec, closefun func(
 }
 
 func (cc *Http2ClientConn) CloseWithError(err error) error {
-	cc.closeCnl(err)
 	if cc.closeFunc != nil {
 		cc.closeFunc(err)
 	}
+	cc.cnl(err)
 	cc.tconn.Close()
 	if cc.http2clientStream != nil {
 		cc.http2clientStream.bodyWriter.CloseWithError(err)
@@ -304,8 +301,8 @@ func (cc *Http2ClientConn) initStream() {
 		bodyWriter: writer,
 		respDone:   make(chan *respC),
 	}
-	cs.writeCtx, cs.writeCnl = context.WithCancel(cc.closeCtx)
-	cs.readCtx, cs.readCnl = context.WithCancelCause(cc.closeCtx)
+	cs.writeCtx, cs.writeCnl = context.WithCancel(cc.ctx)
+	cs.readCtx, cs.readCnl = context.WithCancelCause(cc.ctx)
 	cc.http2clientStream = cs
 	cs.inflow.init(int32(cc.spec.initialWindowSize))
 	cs.flow.add(int32(cc.spec.initialWindowSize))
@@ -331,8 +328,8 @@ func (cc *Http2ClientConn) DoRequest(req *http.Request, orderHeaders []interface
 	select {
 	case respData := <-cc.http2clientStream.respDone:
 		return respData.resp, cc.http2clientStream.readCtx, respData.err
-	case <-cc.CloseCtx().Done():
-		return nil, nil, cc.CloseCtx().Err()
+	case <-cc.ctx.Done():
+		return nil, nil, cc.ctx.Err()
 	case <-req.Context().Done():
 		return nil, nil, req.Context().Err()
 	}
@@ -442,8 +439,8 @@ func (cs *http2clientStream) awaitFlowControl(maxBytes int) (taken int32, err er
 			return
 		}
 		select {
-		case <-cs.cc.closeCtx.Done():
-			return 0, context.Cause(cs.cc.closeCtx)
+		case <-cs.cc.ctx.Done():
+			return 0, context.Cause(cs.cc.ctx)
 		case <-cs.readCtx.Done():
 			return 0, context.Cause(cs.readCtx)
 		case <-cs.cc.flowNotices:
