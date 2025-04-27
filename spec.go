@@ -23,6 +23,7 @@ type Spec struct {
 func (obj *Spec) Hex() string {
 	return tools.Hex(obj.raw)
 }
+
 func (obj *Spec) Bytes() []byte {
 	return obj.raw
 }
