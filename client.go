@@ -541,7 +541,6 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []inter
 		}
 		for k, vv := range req.Header {
 			switch strings.ToLower(k) {
-			case "host", "content-length", "connection", "proxy-connection", "transfer-encoding", "upgrade", "keep-alive":
 			case "cookie":
 				for _, v := range vv {
 					for _, c := range strings.Split(v, "; ") {
@@ -564,7 +563,6 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []inter
 	}
 	enumerateHeaders(func(name, value string) {
 		name = strings.ToLower(name)
-		fmt.Printf(name, value)
 		cc.writeHeader(name, value)
 	})
 	return cc.hbuf.Bytes(), nil
