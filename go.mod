@@ -1,4 +1,4 @@
-module github.com/gospider007/http2
+module github.com/wmm1996528/http2
 
 go 1.24.0
 
