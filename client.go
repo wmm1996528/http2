@@ -564,6 +564,7 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []inter
 	}
 	enumerateHeaders(func(name, value string) {
 		name = strings.ToLower(name)
+		fmt.Printf(name, value)
 		cc.writeHeader(name, value)
 	})
 	return cc.hbuf.Bytes(), nil
