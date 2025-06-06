@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -505,7 +506,39 @@ func (cs *http2clientStream) WriteData(endStream bool, remain []byte) (err error
 	}
 	return
 }
-
+func NewHeadersWithH2(orderHeaders []interface {
+	Key() string
+	Val() any
+}, gospiderHeaders [][2]string) [][2]string {
+	writeHeaders := [][2]string{}
+	filterKey := make(map[string]struct{})
+	for _, orderHeader := range orderHeaders {
+		key := strings.ToLower(orderHeader.Key())
+		val := orderHeader.Val()
+		if key == "cookie" && val == nil {
+			continue
+		}
+		for _, vvs := range gospiderHeaders {
+			if vvs[0] == key {
+				filterKey[key] = struct{}{}
+				writeHeaders = append(writeHeaders, [2]string{key, vvs[1]})
+			}
+		}
+		if _, ok := filterKey[key]; !ok && val != nil {
+			filterKey[key] = struct{}{}
+			writeHeaders = append(writeHeaders, [2]string{key, fmt.Sprintf("%v", val)})
+		}
+	}
+	for _, vvs := range gospiderHeaders {
+		if _, ok := filterKey[vvs[0]]; !ok {
+			writeHeaders = append(writeHeaders, vvs)
+		}
+	}
+	sort.SliceStable(writeHeaders, func(x, y int) bool {
+		return strings.HasPrefix(writeHeaders[x][0], ":") && !strings.HasPrefix(writeHeaders[y][0], ":")
+	})
+	return writeHeaders
+}
 func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []interface {
 	Key() string
 	Val() any
@@ -557,7 +590,7 @@ func (cc *Http2ClientConn) encodeHeaders(req *http.Request, orderHeaders []inter
 		if contentLength, _ := tools.GetContentLength(req); contentLength >= 0 {
 			f("content-length", strconv.FormatInt(contentLength, 10))
 		}
-		for _, kv := range tools.NewHeadersWithH2(orderHeaders, gospiderHeaders) {
+		for _, kv := range NewHeadersWithH2(orderHeaders, gospiderHeaders) {
 			replaceF(kv[0], kv[1])
 		}
 	}
